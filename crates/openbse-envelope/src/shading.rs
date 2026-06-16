@@ -293,7 +293,9 @@ pub fn calculate_sunlit_fraction(
         return 1.0;
     }
 
-    // For single opaque caster, use exact polygon area (no overlap possible)
+    // For a single fully-opaque caster, use exact polygon area (no overlap
+    // possible). Semi-transparent casters (transmittance > 0) leak beam, so they
+    // fall through to the point sampler below which weights coverage by survival.
     if projected_casters_2d.len() == 1 && projected_casters_2d[0].1 == 0.0 {
         let shadow_area = polygon_area_2d(&projected_casters_2d[0].0);
         return (1.0 - shadow_area / recv_area).clamp(0.0, 1.0);
@@ -314,7 +316,13 @@ pub fn calculate_sunlit_fraction(
     }
 
     let mut n_total = 0u32;
-    let mut n_sunlit = 0u32;
+    // Sunlit fraction accumulates beam SURVIVAL per sample, not a 0/1 in-shadow
+    // flag, so semi-transparent casters (e.g. tree canopies) attenuate rather than
+    // fully block. A point covered by casters with transmittances t1, t2, … passes
+    // the product t1·t2·… of the beam (an opaque t=0 caster zeroes it; an
+    // uncovered point keeps the full 1.0). This makes `solar_transmittance` a true
+    // [0-1] leaf-density control instead of an opaque/ignored binary.
+    let mut sunlit = 0.0f64;
     for iu in 0..N_SAMPLES {
         let u_frac = (iu as f64 + 0.5) / N_SAMPLES as f64;
         let u_val = u_min + u_frac * (u_max - u_min);
@@ -326,13 +334,15 @@ pub fn calculate_sunlit_fraction(
                 continue;
             }
             n_total += 1;
-            // Check if ANY caster's projected shadow covers this point
-            let in_shadow = projected_casters_2d.iter().any(|(shadow, transmittance)| {
-                *transmittance == 0.0 && point_in_polygon_2d(&pt, shadow)
-            });
-            if !in_shadow {
-                n_sunlit += 1;
+            // Beam survival at this point = product of every covering caster's
+            // transmittance (1.0 if uncovered).
+            let mut survival = 1.0f64;
+            for (shadow, transmittance) in &projected_casters_2d {
+                if point_in_polygon_2d(&pt, shadow) {
+                    survival *= *transmittance;
+                }
             }
+            sunlit += survival;
         }
     }
 
@@ -340,7 +350,7 @@ pub fn calculate_sunlit_fraction(
         return 1.0;
     }
 
-    n_sunlit as f64 / n_total as f64
+    sunlit / n_total as f64
 }
 
 // ─── Diffuse Sky Shading (Hemisphere Sampling) ──────────────────────────────────
@@ -1269,6 +1279,72 @@ mod tests {
         let casters: Vec<&ShadingPolygon> = vec![&ovh];
         let sf = calculate_sunlit_fraction(&recv, &recv_normal, &casters, &sun_dir);
         assert_relative_eq!(sf, 0.5, max_relative = 0.05);
+    }
+
+    #[test]
+    fn test_sunlit_with_semitransparent_caster() {
+        // Same geometry as test_sunlit_with_overhang (overhang shades the lower
+        // half of the wall), but the caster is semi-transparent (transmittance
+        // 0.5), as a tree canopy would be. The shaded half then passes 50% of the
+        // beam, so sunlit ≈ 0.5 (unshaded half) + 0.5 × 0.5 (shaded half) = 0.75.
+        let recv = vec![
+            Point3D::new(0.0, 0.0, 0.0),
+            Point3D::new(8.0, 0.0, 0.0),
+            Point3D::new(8.0, 0.0, 2.0),
+            Point3D::new(0.0, 0.0, 2.0),
+        ];
+        let recv_normal = Vec3::new(0.0, -1.0, 0.0); // facing south
+
+        let overhang_verts = vec![
+            Point3D::new(0.0, 0.0, 2.0),
+            Point3D::new(0.0, -1.0, 2.0),
+            Point3D::new(8.0, -1.0, 2.0),
+            Point3D::new(8.0, 0.0, 2.0),
+        ];
+        let canopy = ShadingPolygon {
+            name: "canopy".into(),
+            vertices: overhang_verts,
+            normal: Vec3::new(0.0, 0.0, -1.0),
+            solar_transmittance: 0.5, // leaf canopy: passes half the beam
+        };
+
+        let sun_dir = Vec3::new(0.0, 1.0, -1.0).normalize();
+        let casters: Vec<&ShadingPolygon> = vec![&canopy];
+        let sf = calculate_sunlit_fraction(&recv, &recv_normal, &casters, &sun_dir);
+        assert_relative_eq!(sf, 0.75, max_relative = 0.05);
+    }
+
+    #[test]
+    fn test_sunlit_transmittance_monotonic() {
+        // A denser canopy (lower transmittance) must let LESS beam through than a
+        // sparser one over identical geometry — the property the seasonal leaf-on
+        // vs leaf-off model depends on.
+        let recv = vec![
+            Point3D::new(0.0, 0.0, 0.0),
+            Point3D::new(8.0, 0.0, 0.0),
+            Point3D::new(8.0, 0.0, 2.0),
+            Point3D::new(0.0, 0.0, 2.0),
+        ];
+        let recv_normal = Vec3::new(0.0, -1.0, 0.0);
+        let verts = vec![
+            Point3D::new(0.0, 0.0, 2.0),
+            Point3D::new(0.0, -1.0, 2.0),
+            Point3D::new(8.0, -1.0, 2.0),
+            Point3D::new(8.0, 0.0, 2.0),
+        ];
+        let sun_dir = Vec3::new(0.0, 1.0, -1.0).normalize();
+        let make = |t: f64| ShadingPolygon {
+            name: "c".into(),
+            vertices: verts.clone(),
+            normal: Vec3::new(0.0, 0.0, -1.0),
+            solar_transmittance: t,
+        };
+        let dense = make(0.20);
+        let sparse = make(0.75);
+        let sf_dense = calculate_sunlit_fraction(&recv, &recv_normal, &[&dense], &sun_dir);
+        let sf_sparse = calculate_sunlit_fraction(&recv, &recv_normal, &[&sparse], &sun_dir);
+        // Denser canopy → less sunlight reaches the wall.
+        assert!(sf_dense < sf_sparse);
     }
 
     #[test]

@@ -188,13 +188,17 @@ impl SolarCache {
             mix(&mut hash, &[is_outdoor]);
         }
 
-        // Hash shading polygons
+        // Hash shading polygons. Transmittance must be included: two canopies with
+        // identical geometry but different leaf density (e.g. leaf-on vs leaf-off)
+        // produce different beam attenuation, so the cached sunlit fractions differ.
+        // Omitting it lets a leaf-off run reuse a stale leaf-on cache.
         for sp in shading_polygons {
             for v in &sp.vertices {
                 mix(&mut hash, &v.x.to_le_bytes());
                 mix(&mut hash, &v.y.to_le_bytes());
                 mix(&mut hash, &v.z.to_le_bytes());
             }
+            mix(&mut hash, &sp.solar_transmittance.to_le_bytes());
         }
 
         // Hash site parameters
@@ -6094,6 +6098,51 @@ mod tests {
         assert_ne!(
             fp1, fp4,
             "different timesteps_per_hour should change fingerprint"
+        );
+    }
+
+    #[test]
+    fn test_solar_cache_fingerprint_changes_with_transmittance() {
+        // A shading surface's transmittance affects the cached sunlit fractions, so
+        // changing it (leaf-on vs leaf-off) MUST invalidate the cache. Two canopies
+        // with identical geometry but different transmittance must hash differently.
+        let env = make_simple_model();
+        let verts = vec![
+            crate::geometry::Point3D::new(0.0, -2.0, 3.0),
+            crate::geometry::Point3D::new(0.0, -4.0, 3.0),
+            crate::geometry::Point3D::new(8.0, -4.0, 3.0),
+            crate::geometry::Point3D::new(8.0, -2.0, 3.0),
+        ];
+        let canopy = |t: f64| shading::ShadingPolygon {
+            name: "canopy".into(),
+            vertices: verts.clone(),
+            normal: crate::geometry::Vec3::new(0.0, 0.0, -1.0),
+            solar_transmittance: t,
+        };
+
+        let fp_leafon = SolarCache::compute_fingerprint(
+            &env.surfaces,
+            &[canopy(0.20)],
+            40.0,
+            -105.0,
+            -7.0,
+            6,
+            0,
+            8760,
+        );
+        let fp_leafoff = SolarCache::compute_fingerprint(
+            &env.surfaces,
+            &[canopy(0.75)],
+            40.0,
+            -105.0,
+            -7.0,
+            6,
+            0,
+            8760,
+        );
+        assert_ne!(
+            fp_leafon, fp_leafoff,
+            "different shading transmittance must change the cache fingerprint"
         );
     }
 }
