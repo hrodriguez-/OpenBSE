@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`--timeseries` flag** (`openbse-cli`) — opt-in switch to write the full per-timestep results CSV (one row per timestep, one column per component output).
+
+### Changed
+- **Per-timestep results CSV is now opt-in** (`openbse-cli`) — the large `*_results.csv` (which can reach hundreds of MB for big annual models and whose write can take longer than the simulation itself) is no longer written by default. Pass `--timeseries` to restore it. The summary report (`*_summary.txt` / `.html` / `.csv`) is still always written and carries the annual/monthly energy totals most callers need.
+
 ## [0.2.11] - 2026-04-27
 
 ### Added

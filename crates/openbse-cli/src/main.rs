@@ -39,9 +39,17 @@ struct Args {
     #[arg(short, long, value_name = "WEATHER")]
     weather: Option<PathBuf>,
 
-    /// Output CSV file path (default: <input_dir>/results.csv)
+    /// Output CSV file path (default: <input_dir>/results.csv).
+    /// Only written when --timeseries is set.
     #[arg(short, long, value_name = "OUTPUT")]
     output: Option<PathBuf>,
+
+    /// Write the full per-timestep results CSV (one row per timestep, one column
+    /// per component output — can be hundreds of MB for large annual models).
+    /// Off by default: the summary report (txt/html/csv) is always written and
+    /// carries the annual/monthly energy totals most callers need.
+    #[arg(long)]
+    timeseries: bool,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -383,6 +391,12 @@ fn main() -> Result<()> {
         .output
         .clone()
         .unwrap_or_else(|| input_dir.join(format!("{}_results.csv", input_stem)));
+
+    // Per-timestep CSV is opt-in: it can reach hundreds of MB for large annual
+    // models and dominate wall-clock (the write can take longer than the sim).
+    // The summary report below is always written and covers the annual/monthly
+    // totals most callers need.
+    let write_timeseries = args.timeseries;
 
     info!("OpenBSE v{}", env!("CARGO_PKG_VERSION"));
     info!("Reading input file: {}", args.input.display());
@@ -4130,7 +4144,13 @@ fn main() -> Result<()> {
         // In single-run mode: write to the default output path.
         // In parametric mode: skip the default write here (per-run CSVs written at loop end).
         if single_run_mode {
-            if !results.is_empty() {
+            if !write_timeseries {
+                info!(
+                    "Per-timestep CSV skipped ({} timesteps); pass --timeseries to write it. \
+                     Summary report still written.",
+                    results.len()
+                );
+            } else if !results.is_empty() {
                 write_csv(&results, &output_path).with_context(|| {
                     format!("Failed to write results to {}", output_path.display())
                 })?;
@@ -4243,8 +4263,9 @@ fn main() -> Result<()> {
         // ── Parametric result collection ────────────────────────────────────
         if !single_run_mode {
             // In parametric mode, also write per-run CSV with the run name embedded
+            // (opt-in, same as single-run mode).
             let run_csv = input_dir.join(format!("{}_{}_results.csv", input_stem, run_name));
-            if !results.is_empty() {
+            if write_timeseries && !results.is_empty() {
                 write_csv(&results, &run_csv).with_context(|| {
                     format!("Failed to write run results to {}", run_csv.display())
                 })?;
