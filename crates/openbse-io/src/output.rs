@@ -1362,6 +1362,15 @@ struct MonthlyEnergy {
 /// monthly energy breakdown and unmet hours analysis.
 pub struct SummaryReport {
     monthly: [MonthlyEnergy; 12],
+    /// GSHP ground loop: annual heat extracted from the ground [J]
+    ground_extracted_j: f64,
+    /// GSHP ground loop: annual heat rejected to the ground [J]
+    ground_rejected_j: f64,
+    /// GSHP entering water temperature range while running [C]
+    gshp_ewt_min: f64,
+    gshp_ewt_max: f64,
+    /// Hours any GSHP ran
+    gshp_run_hours: f64,
     /// Unmet heating hours: zone temp < heating setpoint - tolerance
     unmet_heating_hours: f64,
     /// Unmet cooling hours: zone temp > cooling setpoint + tolerance
@@ -1419,6 +1428,11 @@ impl SummaryReport {
     ) -> Self {
         Self {
             monthly: Default::default(),
+            ground_extracted_j: 0.0,
+            ground_rejected_j: 0.0,
+            gshp_ewt_min: f64::INFINITY,
+            gshp_ewt_max: f64::NEG_INFINITY,
+            gshp_run_hours: 0.0,
             unmet_heating_hours: 0.0,
             unmet_cooling_hours: 0.0,
             unmet_tolerance: 0.2, // 0.2 deg C tolerance
@@ -1477,6 +1491,28 @@ impl SummaryReport {
         me.heating_j += total_heating * snapshot.dt;
         me.cooling_j += total_cooling * snapshot.dt;
         me.hours += snapshot.dt / 3600.0;
+
+        // Ground-source heat pumps report their ground exchange as a
+        // detailed output; roll it up into the annual loop balance.
+        for vars in snapshot.component_outputs.values() {
+            if let Some(&gh) = vars.get("ground_heat_rate") {
+                if !gh.is_finite() || gh == 0.0 {
+                    continue;
+                }
+                if gh > 0.0 {
+                    self.ground_rejected_j += gh * snapshot.dt;
+                } else {
+                    self.ground_extracted_j += -gh * snapshot.dt;
+                }
+                self.gshp_run_hours += snapshot.dt / 3600.0;
+                if let Some(&ewt) = vars.get("entering_water_temp") {
+                    if ewt.is_finite() {
+                        self.gshp_ewt_min = self.gshp_ewt_min.min(ewt);
+                        self.gshp_ewt_max = self.gshp_ewt_max.max(ewt);
+                    }
+                }
+            }
+        }
 
         // Track peaks with coincident conditions
         if total_heating > self.peak_heating.0 {
@@ -2022,6 +2058,51 @@ impl SummaryReport {
             }
         }
         writeln!(w)?;
+
+        // -- Ground Loop Balance (GSHP) --
+        if self.gshp_run_hours > 0.0 {
+            let ext_kwh = self.ground_extracted_j / 3.6e6;
+            let rej_kwh = self.ground_rejected_j / 3.6e6;
+            let ratio = if rej_kwh > 0.0 {
+                ext_kwh / rej_kwh
+            } else {
+                f64::INFINITY
+            };
+            let verdict = if ratio > 1.5 {
+                "heating-dominated: ground cools over the years, EWT drifts down"
+            } else if ratio < 0.67 {
+                "cooling-dominated: ground warms over the years, EWT drifts up"
+            } else {
+                "balanced"
+            };
+            writeln!(
+                w,
+                "-- Ground Loop Balance (GSHP) ---------------------------------"
+            )?;
+            writeln!(w)?;
+            writeln!(w, "  Heat extracted from ground: {:>10.1} kWh", ext_kwh)?;
+            writeln!(w, "  Heat rejected to ground:    {:>10.1} kWh", rej_kwh)?;
+            writeln!(
+                w,
+                "  Net annual ground load:     {:>10.1} kWh (negative = net extraction)",
+                rej_kwh - ext_kwh
+            )?;
+            if ratio.is_finite() {
+                writeln!(
+                    w,
+                    "  Extraction/rejection ratio: {:>10.2}  ({})",
+                    ratio, verdict
+                )?;
+            } else {
+                writeln!(w, "  Extraction/rejection ratio:        inf  ({})", verdict)?;
+            }
+            writeln!(
+                w,
+                "  Entering water temp range:  {:>6.1} to {:.1} C over {:.0} run hours",
+                self.gshp_ewt_min, self.gshp_ewt_max, self.gshp_run_hours
+            )?;
+            writeln!(w)?;
+        }
 
         // -- Zone Loads Summary --
         if !self.zone_peak_heating.is_empty() || !self.zone_peak_cooling.is_empty() {
@@ -3094,6 +3175,24 @@ impl SummaryReport {
         writeln!(w, "Unmet Cooling Hours,{:.1}", self.unmet_cooling_hours)?;
         let total_unmet = self.unmet_heating_hours + self.unmet_cooling_hours;
         writeln!(w, "Total Unmet Hours,{:.1}", total_unmet)?;
+
+        if self.gshp_run_hours > 0.0 {
+            writeln!(w)?;
+            writeln!(w, "Ground Loop Balance (GSHP)")?;
+            writeln!(
+                w,
+                "Heat extracted from ground [kWh],{:.1}",
+                self.ground_extracted_j / 3.6e6
+            )?;
+            writeln!(
+                w,
+                "Heat rejected to ground [kWh],{:.1}",
+                self.ground_rejected_j / 3.6e6
+            )?;
+            writeln!(w, "EWT min [C],{:.1}", self.gshp_ewt_min)?;
+            writeln!(w, "EWT max [C],{:.1}", self.gshp_ewt_max)?;
+            writeln!(w, "GSHP run hours,{:.0}", self.gshp_run_hours)?;
+        }
 
         w.flush()?;
         Ok(())

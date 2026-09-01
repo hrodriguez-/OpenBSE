@@ -514,6 +514,17 @@ impl AirComponent for GroundSourceHeatPump {
             },
         );
         let compressor = self.power - self.loop_pump_power;
+        m.insert("compressor_power".to_string(), compressor);
+        // Heat exchanged with the ground [W]: positive = rejected to the
+        // loop (cooling: zone heat + compressor work), negative = extracted
+        // from it (heating: delivered heat minus compressor work). Annual
+        // totals of this are the ground-load balance a borefield is sized on.
+        let ground = match self.mode {
+            GshpMode::Cooling => self.air_thermal_output.abs() + compressor,
+            GshpMode::Heating => -(self.air_thermal_output - compressor).max(0.0),
+            GshpMode::Off => 0.0,
+        };
+        m.insert("ground_heat_rate".to_string(), ground);
         m.insert(
             "cop_operating".to_string(),
             if compressor > 0.0 {

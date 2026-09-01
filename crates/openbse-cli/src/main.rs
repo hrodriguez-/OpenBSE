@@ -5147,6 +5147,10 @@ fn simulate_all_loops(
                     if let Some(to) = outputs.get_mut("thermal_output") {
                         *to *= loop_plr;
                     }
+                    // GSHP ground exchange is a thermal quantity too.
+                    if let Some(gh) = outputs.get_mut("ground_heat_rate") {
+                        *gh *= loop_plr;
+                    }
                     if let Some(mf) = outputs.get_mut("mass_flow") {
                         *mf *= loop_plr;
                     }
