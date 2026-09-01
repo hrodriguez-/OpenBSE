@@ -3632,6 +3632,22 @@ fn main() -> Result<()> {
                                         .heat_rejection_power
                                         .insert(comp_name.clone(), pw_m);
                                 }
+                                Some(ComponentKind::Gshp) => {
+                                    // A GSHP is one compressor serving both modes.
+                                    // The summary buckets generic component power
+                                    // by name substring ("heat"/"cool"), so a
+                                    // component named "GSHP-1" was silently dropped
+                                    // from every total. Key it by the mode it ran
+                                    // in this timestep (thermal_output sign) so it
+                                    // lands in Heating (Electric) / Cooling (Electric).
+                                    let q = vars.get("thermal_output").copied().unwrap_or(0.0);
+                                    let key = if q > 0.0 {
+                                        format!("{} [gshp heating]", comp_name)
+                                    } else {
+                                        format!("{} [gshp cooling]", comp_name)
+                                    };
+                                    snapshot.component_electric_power.insert(key, pw_m);
+                                }
                                 _ => {
                                     snapshot
                                         .component_electric_power
@@ -3846,10 +3862,28 @@ fn main() -> Result<()> {
                         };
 
                         for (comp_name, &pw) in &snapshot.component_electric_power {
+                            // GSHP power is keyed "<name> [gshp heating|cooling]" (see
+                            // snapshot population); strip the suffix for kind/submeter
+                            // lookups and route by the mode it ran in.
+                            let gshp_mode = if comp_name.ends_with(" [gshp heating]") {
+                                Some("heating_electric")
+                            } else if comp_name.ends_with(" [gshp cooling]") {
+                                Some("cooling_electric")
+                            } else {
+                                None
+                            };
+                            let base_name: &str = match comp_name.rfind(" [gshp ") {
+                                Some(i) if gshp_mode.is_some() => &comp_name[..i],
+                                _ => comp_name.as_str(),
+                            };
                             let meter = comp_submeter
-                                .get(comp_name)
+                                .get(base_name)
                                 .map(|s| s.as_str())
                                 .unwrap_or("General");
+                            if let Some(end_use) = gshp_mode {
+                                add(sm, meter, end_use, pw);
+                                continue;
+                            }
                             let end_use = match comp_kind_map.get(comp_name) {
                                 Some(ComponentKind::Fan) => "fan_electric",
                                 Some(ComponentKind::CoolingCoil)
@@ -4058,6 +4092,22 @@ fn main() -> Result<()> {
                                     snapshot
                                         .heat_rejection_power
                                         .insert(comp_name.clone(), pw_m);
+                                }
+                                Some(ComponentKind::Gshp) => {
+                                    // A GSHP is one compressor serving both modes.
+                                    // The summary buckets generic component power
+                                    // by name substring ("heat"/"cool"), so a
+                                    // component named "GSHP-1" was silently dropped
+                                    // from every total. Key it by the mode it ran
+                                    // in this timestep (thermal_output sign) so it
+                                    // lands in Heating (Electric) / Cooling (Electric).
+                                    let q = vars.get("thermal_output").copied().unwrap_or(0.0);
+                                    let key = if q > 0.0 {
+                                        format!("{} [gshp heating]", comp_name)
+                                    } else {
+                                        format!("{} [gshp cooling]", comp_name)
+                                    };
+                                    snapshot.component_electric_power.insert(key, pw_m);
                                 }
                                 _ => {
                                     snapshot
@@ -5545,7 +5595,25 @@ fn build_psz_signals(
 
     for name in &li.component_names {
         let lname = name.to_lowercase();
+        // Ground-source heat pump: a single reversible component. Its mode is
+        // derived from outlet setpoint vs inlet temp, so drive the setpoint
+        // to the heating DAT / cooling SAT / off-sentinel per loop mode. The
+        // generic "heat"/"cool" name matching below can't express both modes
+        // on one component (a GSHP named "GSHP-1" got no setpoint at all and
+        // sat in cooling at its 13 C default all winter).
+        let is_gshp = lname.contains("gshp");
+        if is_gshp {
+            let sp = match mode {
+                HvacMode::Heating => heating_dat,
+                HvacMode::Cooling => cooling_coil_sp,
+                HvacMode::Deadband => 99.0, // off sentinel (see gshp.rs)
+            };
+            signals.coil_setpoints.insert(name.clone(), sp);
+        }
+        // NOTE: no early `continue` here — every component, the GSHP
+        // included, must still receive the loop design flow below.
         match mode {
+            _ if is_gshp => {}
             HvacMode::Heating => {
                 // Proportional heating DAT: ramps from setpoint toward max (40°C)
                 // based on zone heating error. At small errors, furnace delivers

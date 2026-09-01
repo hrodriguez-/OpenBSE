@@ -330,8 +330,13 @@ impl AirComponent for GroundSourceHeatPump {
         let t_sp = self.outlet_temp_setpoint;
         let cp = psych::cp_air_fn_w(inlet.state.w);
 
-        // Determine mode from setpoint vs inlet temp
-        let mode = if t_sp < t_in - 0.1 {
+        // Determine mode from setpoint vs inlet temp. The air-loop signal
+        // builders use +/-99 C as "coil off" sentinels (same convention as
+        // the heating/cooling coils); without this guard a 99 C setpoint
+        // read as "heat the air to 99 C" at full capacity.
+        let mode = if t_sp >= 90.0 || t_sp <= -50.0 {
+            GshpMode::Off
+        } else if t_sp < t_in - 0.1 {
             GshpMode::Cooling
         } else if t_sp > t_in + 0.1 {
             GshpMode::Heating
@@ -606,5 +611,39 @@ mod tests {
         gshp.simulate_air(&inlet, &ctx);
         assert_eq!(gshp.power, 0.0);
         assert_eq!(gshp.mode, GshpMode::Off);
+    }
+
+    #[test]
+    fn test_off_sentinel_setpoint_means_off() {
+        // Air-loop builders park idle coils at +/-99 C. Before the guard,
+        // 99 C read as "heat to 99 C" and the GSHP ran flat out in deadband.
+        let mut gshp = make_gshp_cooling();
+        let ctx = make_ctx();
+        let inlet = AirPort::new(MoistAirState::from_tdb_rh(21.0, 0.5, 101325.0), 1.0);
+        gshp.set_setpoint(99.0);
+        let out = gshp.simulate_air(&inlet, &ctx);
+        assert_eq!(gshp.mode, GshpMode::Off);
+        assert_eq!(gshp.power, 0.0);
+        assert_relative_eq!(out.state.t_db, 21.0, max_relative = 1e-6);
+        gshp.set_setpoint(-99.0);
+        gshp.simulate_air(&inlet, &ctx);
+        assert_eq!(gshp.mode, GshpMode::Off);
+    }
+
+    #[test]
+    fn test_setpoint_drives_heating_and_cooling_modes() {
+        let mut gshp = make_gshp_cooling();
+        let ctx = make_ctx();
+        let inlet = AirPort::new(MoistAirState::from_tdb_rh(21.0, 0.5, 101325.0), 1.0);
+        gshp.set_setpoint(35.0);
+        let out = gshp.simulate_air(&inlet, &ctx);
+        assert_eq!(gshp.mode, GshpMode::Heating);
+        assert!(gshp.power > 0.0 && gshp.air_thermal_output > 0.0);
+        assert!(out.state.t_db > 21.0);
+        gshp.set_setpoint(13.0);
+        let out = gshp.simulate_air(&inlet, &ctx);
+        assert_eq!(gshp.mode, GshpMode::Cooling);
+        assert!(gshp.power > 0.0 && gshp.air_thermal_output < 0.0);
+        assert!(out.state.t_db < 21.0);
     }
 }

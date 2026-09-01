@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **GSHP never heated and metered 0 kWh.** The `gshp` air component derives its mode from `outlet_temp_setpoint` vs inlet temperature, but the PSZ signal builder only drove setpoints on components whose *name* contained "heat"/"cool", so a GSHP kept its 13 °C default and sat in cooling all winter (`examples/residential_gshp.yaml`: 5,994 unmet heating hours). Its compressor power was then dropped from the annual summary because end-use bucketing is by name substring (upstream #74). Now: the PSZ builder drives any `gshp` component to the heating DAT / cooling SAT / off per loop mode; the component treats the ±99 °C off-sentinels as Off (previously 99 °C meant "heat to 99 °C"); and snapshot power is keyed `"<name> [gshp heating|cooling]"` from the thermal-output sign so it lands in Heating (Electric) / Cooling (Electric) and in submeters. Residential example after the fix: 2,589 kWh heating electric, 194 kWh cooling electric, 67 unmet heating hours. Still open (upstream #56): no part-load cycling penalty on the GSHP, `eir_ft` applied as a COP multiplier.
+
 ### Added
 - **`--timeseries` flag** (`openbse-cli`) — opt-in switch to write the full per-timestep results CSV (one row per timestep, one column per component output).
 
