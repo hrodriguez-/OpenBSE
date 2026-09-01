@@ -32,6 +32,27 @@ fn default_gshp_cop_heating() -> f64 {
 fn default_loop_depth() -> f64 {
     1.5
 }
+/// Loop-fluid approach above ground temperature while rejecting heat [K].
+/// Typical closed-loop design EWT in cooling is 5-10 K above undisturbed soil.
+fn default_loop_approach_cooling_k() -> f64 {
+    8.0
+}
+/// Loop-fluid approach below ground temperature while extracting heat [K].
+fn default_loop_approach_heating_k() -> f64 {
+    6.0
+}
+/// Ground-loop circulating pump power per kW of heat-pump thermal capacity
+/// [W/kW]. 25 W/kW ~ 88 W/ton, an ASHRAE "B"-grade loop pumping system
+/// (Kavanaugh & Rafferty, Geothermal Heating and Cooling, ch. 8).
+fn default_loop_pump_w_per_kw() -> f64 {
+    25.0
+}
+
+/// ISO 13256-1 ground-loop (GLHP) rating points: the rated COPs are taken
+/// at these entering water temperatures, and the built-in performance model
+/// (used when no `*_ft` curves are supplied) derates/uprates from them.
+pub const ISO_GLHP_COOLING_EWT_C: f64 = 25.0;
+pub const ISO_GLHP_HEATING_EWT_C: f64 = 0.0;
 
 /// Selects how the GSHP determines the ground loop entering water temperature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +112,15 @@ pub struct GroundSourceHeatPump {
     /// Ground loop burial depth [m] (used by Kusuda model)
     #[serde(default = "default_loop_depth")]
     pub loop_depth: f64,
+    /// EWT approach above ground temp in cooling [K]
+    #[serde(default = "default_loop_approach_cooling_k")]
+    pub loop_approach_cooling_k: f64,
+    /// EWT approach below ground temp in heating [K]
+    #[serde(default = "default_loop_approach_heating_k")]
+    pub loop_approach_heating_k: f64,
+    /// Ground-loop pump power per kW of active-mode rated capacity [W/kW]
+    #[serde(default = "default_loop_pump_w_per_kw")]
+    pub loop_pump_w_per_kw: f64,
 
     // ─── Performance curves (optional, resolved at build time) ───────────
     #[serde(skip)]
@@ -128,6 +158,9 @@ pub struct GroundSourceHeatPump {
     /// Current mode
     #[serde(skip)]
     pub mode: GshpMode,
+    /// Ground-loop pump power this timestep [W] (included in `power`)
+    #[serde(skip)]
+    pub loop_pump_power: f64,
 }
 
 impl GroundSourceHeatPump {
@@ -151,6 +184,9 @@ impl GroundSourceHeatPump {
             rated_airflow,
             ground_temp_source: GroundTempSource::Auto,
             loop_depth: 1.5,
+            loop_approach_cooling_k: default_loop_approach_cooling_k(),
+            loop_approach_heating_k: default_loop_approach_heating_k(),
+            loop_pump_w_per_kw: default_loop_pump_w_per_kw(),
             cooling_cap_ft: None,
             cooling_eir_ft: None,
             heating_cap_ft: None,
@@ -164,6 +200,46 @@ impl GroundSourceHeatPump {
             air_thermal_output: 0.0,
             current_ewt: 12.0,
             mode: GshpMode::Off,
+            loop_pump_power: 0.0,
+        }
+    }
+
+    /// Built-in capacity / EIR modifiers vs entering water temperature, used
+    /// when no performance curves are supplied. Linear about the ISO 13256-1
+    /// GLHP rating points, slopes representative of commercial water-to-air
+    /// units (AHRI/ISO catalog data, e.g. ClimateMaster Tranquility series):
+    ///   cooling: capacity -0.5 %/K, EIR +2.7 %/K as EWT rises above 25 C
+    ///   heating: capacity +1.2 %/K, EIR -2.7 %/K as EWT rises above 0 C
+    /// Returns `(cap_mod, eir_mod)` with E+ convention (EIR > 1 = worse).
+    pub fn default_ewt_modifiers(mode: GshpMode, ewt: f64) -> (f64, f64) {
+        match mode {
+            GshpMode::Cooling => {
+                let d = ewt - ISO_GLHP_COOLING_EWT_C;
+                (
+                    (1.0 - 0.005 * d).clamp(0.6, 1.2),
+                    (1.0 + 0.027 * d).clamp(0.5, 2.0),
+                )
+            }
+            GshpMode::Heating => {
+                let d = ewt - ISO_GLHP_HEATING_EWT_C;
+                (
+                    (1.0 + 0.012 * d).clamp(0.6, 1.5),
+                    (1.0 - 0.027 * d).clamp(0.5, 2.0),
+                )
+            }
+            GshpMode::Off => (1.0, 1.0),
+        }
+    }
+
+    /// Entering water temperature for `mode`: undisturbed ground temperature
+    /// on `day_of_year` plus the loop approach (fluid is warmer than the soil
+    /// while rejecting heat, colder while extracting it).
+    pub fn entering_water_temp(&self, mode: GshpMode, day_of_year: u32) -> f64 {
+        let t_ground = self.ground_temp_for_day(day_of_year);
+        match mode {
+            GshpMode::Cooling => t_ground + self.loop_approach_cooling_k,
+            GshpMode::Heating => t_ground - self.loop_approach_heating_k,
+            GshpMode::Off => t_ground,
         }
     }
 
@@ -200,7 +276,7 @@ impl GroundSourceHeatPump {
                     .map(|c| c.evaluate(ewt, indoor_temp))
                     .unwrap_or(1.0);
                 let q = self.rated_cooling_capacity * load_fraction.clamp(0.0, 1.0) * cap_mod;
-                let w = q / (self.cop_cooling * eir_mod).max(0.1);
+                let w = q * eir_mod / self.cop_cooling.max(0.1);
                 let t_supply = self.outlet_temp_setpoint;
                 let mass_flow = (q / (cp * (indoor_temp - t_supply).abs())).max(0.01);
                 self.power = w;
@@ -220,7 +296,7 @@ impl GroundSourceHeatPump {
                     .map(|c| c.evaluate(ewt, indoor_temp))
                     .unwrap_or(1.0);
                 let q = self.rated_heating_capacity * load_fraction.clamp(0.0, 1.0) * cap_mod;
-                let w = q / (self.cop_heating * eir_mod).max(0.1);
+                let w = q * eir_mod / self.cop_heating.max(0.1);
                 let t_supply = self.outlet_temp_setpoint;
                 let mass_flow = (q / (cp * (t_supply - indoor_temp).abs())).max(0.01);
                 self.power = w;
@@ -321,6 +397,7 @@ impl AirComponent for GroundSourceHeatPump {
     fn simulate_air(&mut self, inlet: &AirPort, ctx: &SimulationContext) -> AirPort {
         if inlet.mass_flow <= 0.0 {
             self.power = 0.0;
+            self.loop_pump_power = 0.0;
             self.air_thermal_output = 0.0;
             self.mode = GshpMode::Off;
             return *inlet;
@@ -346,15 +423,17 @@ impl AirComponent for GroundSourceHeatPump {
 
         if mode == GshpMode::Off {
             self.power = 0.0;
+            self.loop_pump_power = 0.0;
             self.air_thermal_output = 0.0;
             self.mode = GshpMode::Off;
             return *inlet;
         }
 
-        // Compute EWT from stored ground temp model
+        // EWT = ground temperature + loop approach for this mode
         let doy = day_of_year(ctx.timestep.month, ctx.timestep.day);
-        let ewt = self.ground_temp_for_day(doy);
+        let ewt = self.entering_water_temp(mode, doy);
         self.current_ewt = ewt;
+        let (def_cap, def_eir) = Self::default_ewt_modifiers(mode, ewt);
 
         match mode {
             GshpMode::Cooling => {
@@ -362,17 +441,21 @@ impl AirComponent for GroundSourceHeatPump {
                     .cooling_cap_ft
                     .as_ref()
                     .map(|c| c.evaluate(ewt, t_in))
-                    .unwrap_or(1.0);
+                    .unwrap_or(def_cap);
                 let eir_mod = self
                     .cooling_eir_ft
                     .as_ref()
                     .map(|c| c.evaluate(ewt, t_in))
-                    .unwrap_or(1.0);
+                    .unwrap_or(def_eir);
                 let cap_available = self.rated_cooling_capacity * cap_mod;
                 let cap_needed = inlet.mass_flow * cp * (t_in - t_sp);
                 let cap_actual = cap_needed.min(cap_available).max(0.0);
                 let t_out = t_in - cap_actual / (inlet.mass_flow * cp).max(1e-6);
-                self.power = cap_actual / (self.cop_cooling * eir_mod).max(0.1);
+                // E+ EquationFit convention: EIR modifier > 1 means more power.
+                let compressor = cap_actual * eir_mod / self.cop_cooling.max(0.1);
+                self.loop_pump_power =
+                    self.loop_pump_w_per_kw * self.rated_cooling_capacity / 1000.0;
+                self.power = compressor + self.loop_pump_power;
                 self.air_thermal_output = -cap_actual;
                 self.mode = GshpMode::Cooling;
                 AirPort::new(
@@ -385,17 +468,20 @@ impl AirComponent for GroundSourceHeatPump {
                     .heating_cap_ft
                     .as_ref()
                     .map(|c| c.evaluate(ewt, t_in))
-                    .unwrap_or(1.0);
+                    .unwrap_or(def_cap);
                 let eir_mod = self
                     .heating_eir_ft
                     .as_ref()
                     .map(|c| c.evaluate(ewt, t_in))
-                    .unwrap_or(1.0);
+                    .unwrap_or(def_eir);
                 let cap_available = self.rated_heating_capacity * cap_mod;
                 let cap_needed = inlet.mass_flow * cp * (t_sp - t_in);
                 let cap_actual = cap_needed.min(cap_available).max(0.0);
                 let t_out = t_in + cap_actual / (inlet.mass_flow * cp).max(1e-6);
-                self.power = cap_actual / (self.cop_heating * eir_mod).max(0.1);
+                let compressor = cap_actual * eir_mod / self.cop_heating.max(0.1);
+                self.loop_pump_power =
+                    self.loop_pump_w_per_kw * self.rated_heating_capacity / 1000.0;
+                self.power = compressor + self.loop_pump_power;
                 self.air_thermal_output = cap_actual;
                 self.mode = GshpMode::Heating;
                 AirPort::new(
@@ -413,6 +499,30 @@ impl AirComponent for GroundSourceHeatPump {
 
     fn power_consumption(&self) -> f64 {
         self.power
+    }
+
+    fn detailed_outputs(&self) -> std::collections::HashMap<String, f64> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("entering_water_temp".to_string(), self.current_ewt);
+        m.insert("loop_pump_power".to_string(), self.loop_pump_power);
+        m.insert(
+            "gshp_mode".to_string(),
+            match self.mode {
+                GshpMode::Heating => 1.0,
+                GshpMode::Cooling => -1.0,
+                GshpMode::Off => 0.0,
+            },
+        );
+        let compressor = self.power - self.loop_pump_power;
+        m.insert(
+            "cop_operating".to_string(),
+            if compressor > 0.0 {
+                self.air_thermal_output.abs() / compressor
+            } else {
+                0.0
+            },
+        );
+        m
     }
 
     fn thermal_output(&self) -> f64 {
@@ -611,6 +721,63 @@ mod tests {
         gshp.simulate_air(&inlet, &ctx);
         assert_eq!(gshp.power, 0.0);
         assert_eq!(gshp.mode, GshpMode::Off);
+    }
+
+    #[test]
+    fn test_ewt_includes_loop_approach_and_derates_cooling() {
+        // Warmer ground -> warmer loop -> more compressor power for the same
+        // cooling; EWT reported = ground + cooling approach.
+        let mut cold = make_gshp_cooling();
+        cold.configure_ground_source(10.0, 0.0, 35.0, 0.04, 1.5, None);
+        let mut warm = make_gshp_cooling();
+        warm.configure_ground_source(25.0, 0.0, 35.0, 0.04, 1.5, None);
+        let ctx = make_ctx();
+        // Small flow so capacity is not the limiter and both deliver the same q.
+        let inlet = AirPort::new(MoistAirState::from_tdb_rh(26.0, 0.5, 101325.0), 0.2);
+        cold.set_setpoint(13.0);
+        warm.set_setpoint(13.0);
+        cold.simulate_air(&inlet, &ctx);
+        warm.simulate_air(&inlet, &ctx);
+        assert_relative_eq!(
+            cold.current_ewt,
+            10.0 + cold.loop_approach_cooling_k,
+            max_relative = 1e-6
+        );
+        assert_relative_eq!(
+            cold.air_thermal_output,
+            warm.air_thermal_output,
+            max_relative = 1e-6
+        );
+        assert!(
+            warm.power > cold.power,
+            "warm {} vs cold {}",
+            warm.power,
+            cold.power
+        );
+        // At exactly the ISO rating EWT the modifiers are unity.
+        assert_eq!(
+            GroundSourceHeatPump::default_ewt_modifiers(GshpMode::Cooling, 25.0),
+            (1.0, 1.0)
+        );
+        assert_eq!(
+            GroundSourceHeatPump::default_ewt_modifiers(GshpMode::Heating, 0.0),
+            (1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn test_loop_pump_power_included_when_running() {
+        let mut gshp = make_gshp_cooling();
+        let ctx = make_ctx();
+        let inlet = AirPort::new(MoistAirState::from_tdb_rh(26.0, 0.5, 101325.0), 1.0);
+        gshp.set_setpoint(13.0);
+        gshp.simulate_air(&inlet, &ctx);
+        let expected_pump = gshp.loop_pump_w_per_kw * gshp.rated_cooling_capacity / 1000.0;
+        assert_relative_eq!(gshp.loop_pump_power, expected_pump, max_relative = 1e-9);
+        assert!(gshp.power > gshp.loop_pump_power);
+        gshp.set_setpoint(99.0);
+        gshp.simulate_air(&inlet, &ctx);
+        assert_eq!(gshp.loop_pump_power, 0.0);
     }
 
     #[test]

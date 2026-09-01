@@ -1146,6 +1146,15 @@ fn default_gshp_cop_heating() -> f64 {
 fn default_loop_depth() -> f64 {
     1.5
 }
+fn default_loop_approach_cooling_k() -> f64 {
+    8.0
+}
+fn default_loop_approach_heating_k() -> f64 {
+    6.0
+}
+fn default_loop_pump_w_per_kw() -> f64 {
+    25.0
+}
 
 /// Ground-source heat pump input.
 ///
@@ -1186,6 +1195,15 @@ pub struct GshpInput {
     /// Ground loop burial depth [m]
     #[serde(default = "default_loop_depth")]
     pub loop_depth: f64,
+    /// Loop-fluid approach above ground temp while rejecting heat [K] (default 8)
+    #[serde(default = "default_loop_approach_cooling_k")]
+    pub loop_approach_cooling_k: f64,
+    /// Loop-fluid approach below ground temp while extracting heat [K] (default 6)
+    #[serde(default = "default_loop_approach_heating_k")]
+    pub loop_approach_heating_k: f64,
+    /// Ground-loop circulating pump power per kW of rated capacity [W/kW] (default 25)
+    #[serde(default = "default_loop_pump_w_per_kw")]
+    pub loop_pump_w_per_kw: f64,
     /// Optional cooling capacity f(EWT, indoor DBT) curve name
     #[serde(default)]
     pub cooling_cap_ft: Option<String>,
@@ -2736,6 +2754,9 @@ pub fn build_graph(model: &ModelInput) -> Result<SimulationGraph, InputError> {
                     );
                     gshp.submeter = g.submeter.clone();
                     gshp.loop_depth = g.loop_depth;
+                    gshp.loop_approach_cooling_k = g.loop_approach_cooling_k;
+                    gshp.loop_approach_heating_k = g.loop_approach_heating_k;
+                    gshp.loop_pump_w_per_kw = g.loop_pump_w_per_kw;
                     gshp.ground_temp_source = match &g.ground_temp_source {
                         GroundTempSource::Auto => openbse_components::gshp::GroundTempSource::Auto,
                         GroundTempSource::EpwMonthly => {
