@@ -1371,10 +1371,21 @@ pub struct SummaryReport {
     gshp_ewt_max: f64,
     /// Hours any GSHP ran
     gshp_run_hours: f64,
-    /// Unmet heating hours: zone temp < heating setpoint - tolerance
+    /// Unmet heating hours: hours in which ANY zone was below its heating
+    /// setpoint by more than the tolerance. Counted once per timestep, not
+    /// once per zone -- see the accumulation site for why.
     unmet_heating_hours: f64,
-    /// Unmet cooling hours: zone temp > cooling setpoint + tolerance
+    /// Unmet cooling hours: hours in which ANY zone was above its cooling
+    /// setpoint by more than the tolerance.
     unmet_cooling_hours: f64,
+    /// Zone-hours out of band, summed over zones. Diagnostic only: it says how
+    /// WIDESPREAD the problem is, where the hour counts say how often it
+    /// happened. Never compared against the 300-hour limit.
+    unmet_heating_zone_hours: f64,
+    unmet_cooling_zone_hours: f64,
+    /// Timesteps in which at least one zone was occupied, for the "% of
+    /// occupied hours" denominator.
+    occupied_timesteps: u64,
     /// Tolerance for unmet hours [deg C]
     unmet_tolerance: f64,
     /// Zone heating setpoints (zone_name -> setpoint)
@@ -1435,6 +1446,9 @@ impl SummaryReport {
             gshp_run_hours: 0.0,
             unmet_heating_hours: 0.0,
             unmet_cooling_hours: 0.0,
+            unmet_heating_zone_hours: 0.0,
+            unmet_cooling_zone_hours: 0.0,
+            occupied_timesteps: 0,
             unmet_tolerance: 0.2, // 0.2 deg C tolerance
             heating_setpoints,
             cooling_setpoints,
@@ -1767,7 +1781,15 @@ impl SummaryReport {
         // Unmet hours check
         // Use per-timestep setpoints (schedule-aware) when available,
         // otherwise fall back to static setpoints from ideal_loads defaults
+        // ASHRAE 90.1 G3.1.2.3 counts an HOUR as unmet when any zone is out of
+        // band; it does not sum across zones. Accumulating per zone made the
+        // total scale with zone count, so the same building reported 10x more
+        // unmet hours simply for being modeled at finer zoning -- and on a
+        // 56-zone model the "hours" exceeded the 8,760 in a year by 25x, which
+        // then drove the percentage below zero.
         let hours_fraction = snapshot.dt / 3600.0;
+        let mut any_zone_under = false;
+        let mut any_zone_over = false;
         for (zone_name, &zone_temp) in &snapshot.zone_temperature {
             let heat_sp = snapshot
                 .zone_heating_setpoint
@@ -1780,14 +1802,35 @@ impl SummaryReport {
 
             if let Some(&sp) = heat_sp {
                 if zone_temp < sp - self.unmet_tolerance {
-                    self.unmet_heating_hours += hours_fraction;
+                    any_zone_under = true;
+                    self.unmet_heating_zone_hours += hours_fraction;
                 }
             }
             if let Some(&sp) = cool_sp {
                 if zone_temp > sp + self.unmet_tolerance {
-                    self.unmet_cooling_hours += hours_fraction;
+                    any_zone_over = true;
+                    self.unmet_cooling_zone_hours += hours_fraction;
                 }
             }
+        }
+        if any_zone_under {
+            self.unmet_heating_hours += hours_fraction;
+        }
+        if any_zone_over {
+            self.unmet_cooling_hours += hours_fraction;
+        }
+
+        // "% of occupied hours" must divide by OCCUPIED hours. Dividing by all
+        // timesteps understates the shortfall in a building that is occupied
+        // only part of the week -- a visitor center is empty ~2/3 of the year.
+        // People sensible gain stands in for an occupancy flag: it is nonzero
+        // exactly when the occupancy schedule is.
+        if snapshot
+            .zone_gain_people_sensible
+            .values()
+            .any(|&gain| gain > 0.0)
+        {
+            self.occupied_timesteps += 1;
         }
     }
 
@@ -2024,11 +2067,35 @@ impl SummaryReport {
             self.unmet_cooling_hours
         )?;
 
-        let total_hours = self.total_timesteps as f64 * self.dt / 3600.0;
-        if total_hours > 0.0 {
-            let heat_pct = self.unmet_heating_hours / total_hours * 100.0;
-            let cool_pct = self.unmet_cooling_hours / total_hours * 100.0;
+        writeln!(
+            w,
+            "  (zone-hours out of band: {:.0} heating, {:.0} cooling)",
+            self.unmet_heating_zone_hours, self.unmet_cooling_zone_hours
+        )?;
+
+        // Denominator is OCCUPIED hours, per the label. Fall back to all hours
+        // only when no occupancy was ever scheduled (e.g. a warehouse or a
+        // lights-out data center), where the two are the same question.
+        let all_hours = self.total_timesteps as f64 * self.dt / 3600.0;
+        let occupied_hours = self.occupied_timesteps as f64 * self.dt / 3600.0;
+        let basis_hours = if occupied_hours > 0.0 {
+            occupied_hours
+        } else {
+            all_hours
+        };
+        if basis_hours > 0.0 {
+            // Clamp: the counts are now bounded by the simulated hours, so a
+            // negative percentage is impossible -- but a partial-year run
+            // could still divide by a shorter basis, and "-2562% met" helps
+            // nobody. Report the floor instead.
+            let heat_pct = (self.unmet_heating_hours / basis_hours * 100.0).min(100.0);
+            let cool_pct = (self.unmet_cooling_hours / basis_hours * 100.0).min(100.0);
             writeln!(w)?;
+            writeln!(
+                w,
+                "  Occupied hours: {:.0} of {:.0} simulated",
+                occupied_hours, all_hours
+            )?;
             writeln!(
                 w,
                 "  Heating setpoint met: {:>5.1}% of occupied hours",
@@ -2500,7 +2567,11 @@ impl SummaryReport {
             self.dt,
             3600.0 / self.dt
         )?;
-        writeln!(w, "  Simulated hours:   {:>8.1} hr", total_hours)?;
+        writeln!(
+            w,
+            "  Simulated hours:   {:>8.1} hr",
+            self.total_timesteps as f64 * self.dt / 3600.0
+        )?;
         writeln!(w)?;
 
         // -- Submeter Breakdown --
