@@ -1788,6 +1788,25 @@ impl SummaryReport {
         // 56-zone model the "hours" exceeded the 8,760 in a year by 25x, which
         // then drove the percentage below zero.
         let hours_fraction = snapshot.dt / 3600.0;
+
+        // Only OCCUPIED hours count. ASHRAE 90.1 G3.1.2.3 judges the system
+        // against the setpoint when people are there; a night setback is a
+        // correct control action, not a failure to meet the setpoint. Counting
+        // every hour but dividing by occupied hours also lets the ratio exceed
+        // 1.0 -- the engine's own vav_reheat example reports 4,706 unmet hours
+        // against 3,120 occupied, which then clamps to a meaningless
+        // "0.0% of occupied hours met" while the reheat coils are in fact
+        // delivering 40,961 kWh.
+        let occupied = snapshot
+            .zone_gain_people_sensible
+            .values()
+            .any(|&gain| gain > 0.0);
+        if occupied {
+            self.occupied_timesteps += 1;
+        } else {
+            return;
+        }
+
         let mut any_zone_under = false;
         let mut any_zone_over = false;
         for (zone_name, &zone_temp) in &snapshot.zone_temperature {
@@ -1818,19 +1837,6 @@ impl SummaryReport {
         }
         if any_zone_over {
             self.unmet_cooling_hours += hours_fraction;
-        }
-
-        // "% of occupied hours" must divide by OCCUPIED hours. Dividing by all
-        // timesteps understates the shortfall in a building that is occupied
-        // only part of the week -- a visitor center is empty ~2/3 of the year.
-        // People sensible gain stands in for an occupancy flag: it is nonzero
-        // exactly when the occupancy schedule is.
-        if snapshot
-            .zone_gain_people_sensible
-            .values()
-            .any(|&gain| gain > 0.0)
-        {
-            self.occupied_timesteps += 1;
         }
     }
 
