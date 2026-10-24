@@ -78,6 +78,16 @@ pub struct VAVBox {
     ///   cooling: damper opens proportional to |control_signal|
     #[serde(skip)]
     pub control_signal: f64,
+    /// Temperature of the served zone [°C], set by the driver each timestep
+    /// (`set_zone_temp`).  `None` until the first call; the box then falls back
+    /// to treating the control signal as the coil duty fraction.
+    #[serde(skip)]
+    pub zone_temp: Option<f64>,
+    /// Net zone load to setpoint [W] (+heating / −cooling), set by the driver
+    /// each timestep (`set_zone_load`).  When both this and `zone_temp` are
+    /// known the box picks its own mode from them instead of `control_signal`.
+    #[serde(skip)]
+    pub zone_load: Option<f64>,
 
     // ─── Runtime state ───────────────────────────────────────────────────
     /// Current damper position [0-1]
@@ -131,6 +141,8 @@ impl VAVBox {
             design_hw_inlet_temp: 82.0,
             design_hw_outlet_temp: 71.0,
             control_signal: 0.0,
+            zone_temp: None,
+            zone_load: None,
             damper_position: 0.0,
             primary_air_flow: 0.0,
             reheat_rate: 0.0,
@@ -158,6 +170,55 @@ impl VAVBox {
         self.max_reheat_temp = temp;
         self
     }
+
+    /// Reheat coil duty [W] needed at `flow` so the zone receives the net
+    /// heating demand carried by the control signal.
+    ///
+    /// The primary air arrives at the AHU cold-deck temperature (12-15 °C).
+    /// Before the box delivers any net heat it has to lift that air to zone
+    /// temperature, so the coil duty is the net demand plus
+    /// `m × cp × (T_zone − T_inlet)`.  Without that term a box fed 13 °C air
+    /// at minimum flow cools the zone it is meant to heat and the zone never
+    /// recovers (the engine's own `vav_reheat` example logged thousands of
+    /// unmet heating hours for exactly this reason).
+    fn coil_duty_w(&self, t_inlet: f64, cp_air: f64, flow: f64) -> f64 {
+        // Net load: the driver's signed zone load when known (it may be a
+        // small cooling load that minimum flow over-serves), else the signal.
+        let q_net = match (self.zone_temp, self.zone_load) {
+            (Some(_), Some(q)) => q,
+            _ => self.control_signal.clamp(0.0, 1.0) * self.reheat_capacity,
+        };
+        let lift = match self.zone_temp {
+            Some(t_zone) => (flow * cp_air * (t_zone - t_inlet)).max(0.0),
+            None => 0.0,
+        };
+        (q_net + lift).max(0.0)
+    }
+
+    /// Fraction of coil capacity the box will need at the heating maximum
+    /// flow — drives the dual-maximum damper ramp.
+    fn heating_duty_fraction(&self, t_inlet: f64, cp_air: f64, heat_max_flow: f64) -> f64 {
+        if self.reheat_capacity <= 0.0 {
+            return self.control_signal.clamp(0.0, 1.0);
+        }
+        // Only a positive net heating demand opens the damper; tempering a
+        // small cooling load happens at minimum flow.  The ramp reaches the
+        // heating maximum when the demand uses up what the coil has left
+        // after lifting the heating-max flow to zone temperature.
+        let q_net = match (self.zone_temp, self.zone_load) {
+            (Some(_), Some(q)) => q,
+            _ => self.control_signal.clamp(0.0, 1.0) * self.reheat_capacity,
+        };
+        if q_net <= 0.0 {
+            return 0.0;
+        }
+        let lift_at_max = match self.zone_temp {
+            Some(t_zone) => (heat_max_flow * cp_air * (t_zone - t_inlet)).max(0.0),
+            None => 0.0,
+        };
+        let available = (self.reheat_capacity - lift_at_max).max(0.1 * self.reheat_capacity);
+        (q_net / available).clamp(0.0, 1.0)
+    }
 }
 
 impl AirComponent for VAVBox {
@@ -183,6 +244,41 @@ impl AirComponent for VAVBox {
         let cp_air = psych::cp_air_fn_w(inlet.state.w);
         let min_flow = self.max_air_flow * self.min_flow_fraction;
 
+        // ─── Load-based control (zone temperature and net load known) ─────
+        //
+        // E+ "Reverse" reheat action: at minimum flow the cold primary air
+        // removes m_min·cp·(T_zone − T_in) from the zone.  If the zone needs
+        // less cooling than that (a small cooling load, deadband, or heating),
+        // the damper stays at minimum and the coil tempers the air so the zone
+        // receives exactly its net load.  Only when the zone needs more
+        // cooling than minimum flow provides does the damper open.
+        if let (Some(t_zone), Some(q_net)) = (self.zone_temp, self.zone_load) {
+            let min_flow_cooling = min_flow * cp_air * (t_zone - inlet.state.t_db);
+            let duty_at_min = q_net + min_flow_cooling;
+            if duty_at_min > 0.0 && !matches!(self.reheat_type, ReheatType::None) {
+                // Heating / tempering: express the net load as a capacity
+                // fraction so the existing heating path (dual-maximum ramp,
+                // coil duty incl. the cold-air lift) handles it.
+                self.control_signal = if self.reheat_capacity > 0.0 {
+                    (q_net / self.reheat_capacity)
+                        .clamp(0.0, 1.0)
+                        .max(f64::MIN_POSITIVE)
+                } else {
+                    f64::MIN_POSITIVE
+                };
+            } else if duty_at_min > 0.0 {
+                // No coil: nothing to temper with, sit at minimum flow.
+                self.control_signal = 0.0;
+            } else {
+                // Cooling: flow that meets the load at the current supply temp.
+                let dt = (t_zone - inlet.state.t_db).max(0.5);
+                let m_needed = (-q_net) / (cp_air * dt);
+                let frac = ((m_needed - min_flow) / (self.max_air_flow - min_flow).max(1e-6))
+                    .clamp(0.0, 1.0);
+                self.control_signal = -frac;
+            }
+        }
+
         // ─── Determine damper position based on zone load signal ─────────
         // control_signal > 0 → zone needs heating → damper at minimum, reheat on
         // control_signal < 0 → zone needs cooling → damper modulates open
@@ -200,9 +296,9 @@ impl AirComponent for VAVBox {
         } else if self.control_signal > 0.0 {
             // HEATING MODE: dual-maximum (ReverseWithLimits)
             // Damper opens from min_flow toward max_reheat_fraction for more
-            // reheat capacity. Higher heating demand → wider damper.
+            // reheat capacity. Higher coil duty → wider damper.
             let heat_max_flow = self.max_air_flow * self.max_reheat_fraction;
-            let heat_frac = self.control_signal.clamp(0.0, 1.0);
+            let heat_frac = self.heating_duty_fraction(inlet.state.t_db, cp_air, heat_max_flow);
             let flow = min_flow + heat_frac * (heat_max_flow - min_flow);
             (flow, true)
         } else {
@@ -225,10 +321,10 @@ impl AirComponent for VAVBox {
 
         // ─── Reheat coil ─────────────────────────────────────────────────
         if needs_reheat && !matches!(self.reheat_type, ReheatType::None) {
-            // control_signal is 0.0 to 1.0 fractional heating demand.
-            // Scale by reheat_capacity to get desired heating in Watts.
-            let heating_frac = self.control_signal.clamp(0.0, 1.0);
-            let q_heating_demand = heating_frac * self.reheat_capacity;
+            // control_signal is the zone's net heating demand as a fraction of
+            // reheat_capacity; the coil also has to lift the primary air to
+            // zone temperature (see coil_duty_w).
+            let q_heating_demand = self.coil_duty_w(inlet.state.t_db, cp_air, actual_flow);
 
             match self.reheat_type {
                 ReheatType::Electric => {
@@ -313,6 +409,47 @@ impl AirComponent for VAVBox {
     fn set_setpoint(&mut self, signal: f64) {
         // For VAV boxes, "setpoint" is overloaded as the zone load signal
         self.control_signal = signal;
+    }
+
+    fn set_zone_temp(&mut self, temp: f64) {
+        self.zone_temp = Some(temp);
+    }
+
+    fn set_zone_load(&mut self, q_net_w: f64) {
+        self.zone_load = Some(q_net_w);
+    }
+
+    /// Autosize from the zone's sizing results.
+    ///
+    /// - `max_air_flow`: the zone design airflow.
+    /// - `max_reheat_fraction`: raised so the heating maximum flow is at least
+    ///   the zone's heating design airflow (E+ autosizes "Maximum Flow Fraction
+    ///   During Reheat" the same way).  A perimeter zone whose heating airflow
+    ///   exceeds half its cooling airflow would otherwise never reach setpoint.
+    /// - `reheat_capacity`: enough to take the heating-max flow from the AHU
+    ///   cold deck to `max_reheat_temp` (the E+ reheat coil sizing basis), and
+    ///   at least the zone peak heating load plus the cold-air lift.
+    fn set_terminal_sizing(&mut self, sizing: &TerminalSizing) {
+        if openbse_core::types::is_autosize(self.max_air_flow) {
+            self.max_air_flow = sizing.design_flow.max(0.01);
+        }
+        if self.max_air_flow > 0.0 && sizing.heating_flow > 0.0 {
+            let needed = (sizing.heating_flow / self.max_air_flow).clamp(0.0, 1.0);
+            self.max_reheat_fraction = self.max_reheat_fraction.max(needed);
+        }
+        if openbse_core::types::is_autosize(self.reheat_capacity) {
+            if matches!(self.reheat_type, ReheatType::None) {
+                self.reheat_capacity = 0.0;
+                return;
+            }
+            let cp = 1005.0;
+            let m_heat = self.max_air_flow * self.max_reheat_fraction;
+            let to_max_temp =
+                m_heat * cp * (self.max_reheat_temp - sizing.primary_supply_temp).max(1.0);
+            let for_peak = sizing.peak_heating
+                + m_heat * cp * (sizing.heating_setpoint - sizing.primary_supply_temp).max(0.0);
+            self.reheat_capacity = to_max_temp.max(for_peak);
+        }
     }
 
     fn setpoint(&self) -> Option<f64> {
@@ -454,6 +591,96 @@ mod tests {
         // Water outlet should be cooler than inlet
         let wo = vav.water_outlet().unwrap();
         assert!(wo.state.temp < 82.0);
+    }
+
+    #[test]
+    fn test_vav_reheat_covers_cold_primary_air_lift() {
+        // Zone at 21 °C fed 13 °C primary air. Net demand 1 kW. Without the
+        // lift term the coil would deliver 1 kW but the zone would see
+        // 1 kW − m·cp·8 K, i.e. net cooling.
+        let mut vav = VAVBox::new(
+            "Zone1 VAV",
+            "Zone1",
+            1.0,
+            0.3,
+            ReheatType::Electric,
+            20000.0,
+        );
+        vav.set_zone_temp(21.0);
+        vav.control_signal = 1000.0 / 20000.0;
+        let inlet = make_supply_air(13.0, 2.0);
+        let outlet = vav.simulate_air(&inlet, &make_ctx());
+        let cp = psych::cp_air_fn_w(inlet.state.w);
+        let net_to_zone = outlet.mass_flow * cp * (outlet.state.t_db - 21.0);
+        assert_relative_eq!(net_to_zone, 1000.0, max_relative = 0.02);
+        assert!(vav.reheat_rate > 1000.0);
+    }
+
+    #[test]
+    fn test_vav_tempers_minimum_flow_when_cooling_load_is_small() {
+        // Zone at 21 °C with a 500 W cooling load. Minimum flow of 13 °C air
+        // removes 0.3·cp·8 ≈ 2.4 kW, so the coil must temper the air (E+
+        // Reverse action) and the zone must receive exactly −500 W.
+        let mut vav = VAVBox::new(
+            "Zone1 VAV",
+            "Zone1",
+            1.0,
+            0.3,
+            ReheatType::HotWater,
+            20000.0,
+        );
+        vav.set_zone_temp(21.0);
+        vav.set_zone_load(-500.0);
+        let inlet = make_supply_air(13.0, 2.0);
+        let outlet = vav.simulate_air(&inlet, &make_ctx());
+        let cp = psych::cp_air_fn_w(inlet.state.w);
+        assert_relative_eq!(outlet.mass_flow, 0.3, max_relative = 0.01);
+        let net_to_zone = outlet.mass_flow * cp * (outlet.state.t_db - 21.0);
+        assert_relative_eq!(net_to_zone, -500.0, max_relative = 0.02);
+        assert!(vav.reheat_rate > 0.0);
+    }
+
+    #[test]
+    fn test_vav_opens_damper_when_cooling_load_exceeds_minimum_flow() {
+        let mut vav = VAVBox::new(
+            "Zone1 VAV",
+            "Zone1",
+            1.0,
+            0.3,
+            ReheatType::HotWater,
+            20000.0,
+        );
+        vav.set_zone_temp(24.0);
+        vav.set_zone_load(-6000.0); // needs ~0.54 kg/s of 13 °C air
+        let inlet = make_supply_air(13.0, 2.0);
+        let outlet = vav.simulate_air(&inlet, &make_ctx());
+        let cp = psych::cp_air_fn_w(inlet.state.w);
+        assert_eq!(vav.reheat_rate, 0.0);
+        let net_to_zone = outlet.mass_flow * cp * (outlet.state.t_db - 24.0);
+        assert_relative_eq!(net_to_zone, -6000.0, max_relative = 0.02);
+    }
+
+    #[test]
+    fn test_vav_terminal_sizing_raises_heating_max_flow_and_capacity() {
+        let mut vav = VAVBox::new(
+            "Zone1 VAV",
+            "Zone1",
+            openbse_core::types::AUTOSIZE,
+            0.3,
+            ReheatType::HotWater,
+            openbse_core::types::AUTOSIZE,
+        );
+        vav.set_terminal_sizing(&TerminalSizing {
+            design_flow: 1.0,
+            heating_flow: 0.8, // heating governs more than the 50% dual max
+            peak_heating: 8000.0,
+            primary_supply_temp: 13.0,
+            heating_setpoint: 21.0,
+        });
+        assert_relative_eq!(vav.max_air_flow, 1.0);
+        assert_relative_eq!(vav.max_reheat_fraction, 0.8);
+        // 0.8 kg/s x 1005 x (40 - 13) = 21.7 kW >= 8 kW + 0.8*1005*8 = 14.4 kW
+        assert!(vav.reheat_capacity > 21_000.0 && vav.reheat_capacity < 22_000.0);
     }
 
     #[test]

@@ -118,6 +118,22 @@ impl WaterPort {
     }
 }
 
+/// Zone-level sizing results handed to a terminal box (see
+/// [`AirComponent::set_terminal_sizing`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalSizing {
+    /// Zone design (cooling-or-heating governed) airflow [kg/s].
+    pub design_flow: f64,
+    /// Zone heating design airflow [kg/s] at the heating supply temperature.
+    pub heating_flow: f64,
+    /// Zone peak heating load [W], already multiplied by the heating sizing factor.
+    pub peak_heating: f64,
+    /// Primary (AHU cold-deck) supply air temperature the box is fed with [°C].
+    pub primary_supply_temp: f64,
+    /// Zone heating setpoint [°C].
+    pub heating_setpoint: f64,
+}
+
 // ─── Component Traits ────────────────────────────────────────────────────────
 
 /// Trait for air-side components (fans, coils, mixing boxes, etc.).
@@ -232,6 +248,24 @@ pub trait AirComponent: std::fmt::Debug {
     /// Set heating nominal capacity [W] for heat pump components with separate
     /// heating and cooling capacities.  Default no-op.
     fn set_heating_capacity(&mut self, _cap: f64) {}
+
+    /// Tell a zone terminal the current temperature of the zone it serves [°C].
+    /// Terminal reheat has to lift the cold primary air to zone temperature
+    /// before it delivers any net heat, so the box needs this to size its coil
+    /// duty.  Default no-op — only terminal boxes override this.
+    fn set_zone_temp(&mut self, _temp: f64) {}
+
+    /// Tell a zone terminal the net load its zone needs this timestep to
+    /// reach setpoint [W], positive = heating, negative = cooling.  With the
+    /// zone temperature this lets a reheat box decide for itself whether the
+    /// minimum-flow primary air over-cools the zone and must be tempered
+    /// (E+ AirTerminal:SingleDuct:VAV:Reheat "Reverse" action).  Default no-op.
+    fn set_zone_load(&mut self, _q_net_w: f64) {}
+
+    /// Hand a zone terminal its zone's sizing results so it can autosize
+    /// itself (max airflow, heating max flow, reheat capacity).  Called once
+    /// after zone sizing, before the generic autosize fallbacks.  Default no-op.
+    fn set_terminal_sizing(&mut self, _sizing: &TerminalSizing) {}
 
     /// Inject ground temperature model parameters for ground-source heat pump
     /// components.  Called at build time by the simulation driver after reading

@@ -2867,6 +2867,9 @@ pub fn build_graph(model: &ModelInput) -> Result<SimulationGraph, InputError> {
                             vb.reheat_capacity.to_f64(),
                         );
                         box_component.submeter = vb.submeter.clone();
+                        if let Some(t) = vb.max_reheat_temp {
+                            box_component.max_reheat_temp = t;
+                        }
                         graph.add_air_component(Box::new(box_component))
                     }
                     TerminalInput::PfpBox(pb) => {

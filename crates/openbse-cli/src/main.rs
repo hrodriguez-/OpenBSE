@@ -708,24 +708,43 @@ fn main() -> Result<()> {
                     .collect()
             })
             .unwrap_or_default();
+        let zone_areas: HashMap<String, f64> = envelope
+            .as_ref()
+            .map(|env| {
+                env.zones
+                    .iter()
+                    .map(|z| (z.input.name.clone(), z.input.floor_area.max(0.0)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut comp_zone_multiplier: HashMap<String, f64> = HashMap::new();
         for li in &loop_infos {
-            let mult: f64 = li
-                .served_zones
-                .iter()
-                .filter_map(|z| zone_multipliers.get(z))
-                .max()
-                .copied()
-                .unwrap_or(1) as f64;
+            // A terminal box serves one zone: it carries that zone's multiplier.
+            for (zone, term_name) in &li.terminal_boxes {
+                let m = zone_multipliers.get(zone).copied().unwrap_or(1) as f64;
+                if m > 1.0 {
+                    comp_zone_multiplier.insert(term_name.clone(), m);
+                }
+            }
+            // Loop-level equipment (fan, coils) is sized from the sum of the
+            // served zones' unmultiplied flows, so its energy scales by the
+            // floor-area-weighted mean multiplier of those zones — not the
+            // maximum, which doubled the AHU fan/cooling and every terminal on a
+            // bottom/middle×2/top model (a 33 % building read as 100 % bigger).
+            let (mut wsum, mut asum) = (0.0_f64, 0.0_f64);
+            for z in &li.served_zones {
+                let m = zone_multipliers.get(z).copied().unwrap_or(1) as f64;
+                let a = zone_areas.get(z).copied().unwrap_or(1.0).max(1e-6);
+                wsum += m * a;
+                asum += a;
+            }
+            let mult = if asum > 0.0 { wsum / asum } else { 1.0 };
             if mult > 1.0 {
                 for comp_name in &li.component_names {
                     comp_zone_multiplier.insert(comp_name.clone(), mult);
                 }
-                for (_zone, term_name) in &li.terminal_boxes {
-                    comp_zone_multiplier.insert(term_name.clone(), mult);
-                }
                 info!(
-                    "Zone multiplier {:.0} applied to loop '{}' components",
+                    "Zone multiplier {:.2} (area-weighted) applied to loop '{}' components",
                     mult, li.name
                 );
             }
@@ -1598,13 +1617,66 @@ fn main() -> Result<()> {
                     for (zone_name, term_name) in &li.terminal_boxes {
                         if let Some(node_idx) = graph.node_by_name(term_name) {
                             if let GraphComponent::Air(comp) = graph.component_mut(node_idx) {
+                                // Let the terminal size itself from its zone first
+                                // (VAV boxes raise their heating max flow and size
+                                // the reheat coil for the cold-deck lift); the
+                                // generic fallbacks below only fill what is still
+                                // autosize afterwards.
+                                // Zone sizing folds zone_multiplier into the peak
+                                // loads and airflows (system sizing wants the whole
+                                // stack); a terminal serves ONE zone, so divide it
+                                // back out or a x2 mid-floor box runs twice the
+                                // minimum flow and twice the reheat of its zone.
+                                let zmult =
+                                    zone_multipliers.get(zone_name).copied().unwrap_or(1) as f64;
+                                let zmult = zmult.max(1.0);
+                                let sizing = openbse_core::ports::TerminalSizing {
+                                    design_flow: sizing_result
+                                        .zone_design_airflow
+                                        .get(zone_name)
+                                        .copied()
+                                        .unwrap_or(0.1)
+                                        / zmult,
+                                    heating_flow: sizing_result
+                                        .zone_heating_airflow
+                                        .get(zone_name)
+                                        .copied()
+                                        .unwrap_or(0.0)
+                                        / zmult,
+                                    peak_heating: sizing_result
+                                        .zone_peak_heating
+                                        .get(zone_name)
+                                        .copied()
+                                        .unwrap_or(0.0)
+                                        * model.simulation.heating_sizing_factor
+                                        / zmult,
+                                    primary_supply_temp: li.cooling_supply_temp,
+                                    heating_setpoint: zone_heating_setpoints
+                                        .get(zone_name)
+                                        .copied()
+                                        .unwrap_or(21.0),
+                                };
+                                comp.set_terminal_sizing(&sizing);
+                                if let Some(cap) = comp.nominal_capacity() {
+                                    if !is_autosize(cap) && cap > 0.0 {
+                                        info!(
+                                            "Terminal '{}': max airflow {:.4} kg/s, heating max {:.0}% , reheat {:.1} kW",
+                                            term_name,
+                                            comp.design_air_flow_rate().unwrap_or(0.0),
+                                            100.0 * sizing.heating_flow.max(0.0)
+                                                / comp.design_air_flow_rate().unwrap_or(1.0).max(1e-6),
+                                            cap / 1000.0
+                                        );
+                                    }
+                                }
                                 // Size terminal max_air_flow from zone design airflow
                                 if comp.design_air_flow_rate().is_none() {
                                     let zone_flow = sizing_result
                                         .zone_design_airflow
                                         .get(zone_name)
                                         .copied()
-                                        .unwrap_or(0.1);
+                                        .unwrap_or(0.1)
+                                        / zmult;
                                     // Set in kg/s — terminal boxes use max_air_flow as mass flow
                                     // (compared against inlet.mass_flow in kg/s), unlike fans
                                     // which use design_flow_rate in m³/s.
@@ -1623,10 +1695,107 @@ fn main() -> Result<()> {
                                             .get(zone_name)
                                             .copied()
                                             .unwrap_or(0.0)
-                                            * model.simulation.heating_sizing_factor;
+                                            * model.simulation.heating_sizing_factor
+                                            / zmult;
                                         comp.set_nominal_capacity(zone_heat);
                                         info!("Autosized terminal '{}' reheat capacity: {:.0} W ({:.1} kW)",
                                         term_name, zone_heat, zone_heat / 1000.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── Plant Equipment Capacity Autosizing ───────────────────────
+                //
+                // A boiler or chiller left at `capacity: autosize` is sized to
+                // the sum of the design capacities of the coils, terminal
+                // reheat boxes and radiant panels that name its loop (E+
+                // Sizing:Plant non-coincident sizing). Without this the
+                // component kept the autosize sentinel as its capacity and a
+                // loop fed only by terminal reheat ran the boiler at a negative
+                // load (negative fuel, no gas end use).
+                {
+                    use openbse_io::input::{EquipmentInput, PlantEquipmentInput, TerminalInput};
+                    for pl in &model.plant_loops {
+                        let has_autosized = pl.supply_equipment.iter().any(|eq| match eq {
+                            PlantEquipmentInput::Boiler(b) => is_autosize(b.capacity.to_f64()),
+                            PlantEquipmentInput::Chiller(c) => is_autosize(c.capacity.to_f64()),
+                            _ => false,
+                        });
+                        if !has_autosized {
+                            continue;
+                        }
+                        let mut connected: Vec<String> = Vec::new();
+                        for al in &model.air_loops {
+                            for eq in &al.equipment {
+                                let (name, loop_ref) = match eq {
+                                    EquipmentInput::HeatingCoil(c) => {
+                                        (&c.name, c.plant_loop.as_deref())
+                                    }
+                                    EquipmentInput::CoolingCoil(c) => {
+                                        (&c.name, c.plant_loop.as_deref())
+                                    }
+                                    _ => continue,
+                                };
+                                if loop_ref == Some(pl.name.as_str()) {
+                                    connected.push(name.clone());
+                                }
+                            }
+                            for zc in &al.zone_terminals {
+                                if let Some(TerminalInput::VavBox(vb)) = &zc.terminal {
+                                    if vb.plant_loop.as_deref() == Some(pl.name.as_str()) {
+                                        connected.push(vb.name.clone());
+                                    }
+                                }
+                            }
+                        }
+                        let mut total_cap = 0.0_f64;
+                        for name in &connected {
+                            if let Some(idx) = graph.node_by_name(name) {
+                                if let GraphComponent::Air(comp) = graph.component_mut(idx) {
+                                    if let Some(cap) = comp.nominal_capacity() {
+                                        if !is_autosize(cap) && cap > 0.0 {
+                                            total_cap += cap;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for rp in &model.radiant_panels {
+                            if rp.plant_loop.as_deref() == Some(pl.name.as_str()) {
+                                let cap = rp.rated_capacity.to_f64();
+                                if !is_autosize(cap) && cap > 0.0 {
+                                    total_cap += cap;
+                                }
+                            }
+                        }
+                        if total_cap <= 0.0 {
+                            continue;
+                        }
+                        for eq in &pl.supply_equipment {
+                            let name = match eq {
+                                PlantEquipmentInput::Boiler(b)
+                                    if is_autosize(b.capacity.to_f64()) =>
+                                {
+                                    &b.name
+                                }
+                                PlantEquipmentInput::Chiller(c)
+                                    if is_autosize(c.capacity.to_f64()) =>
+                                {
+                                    &c.name
+                                }
+                                _ => continue,
+                            };
+                            if let Some(idx) = graph.node_by_name(name) {
+                                if let GraphComponent::Plant(comp) = graph.component_mut(idx) {
+                                    if comp.nominal_capacity().is_none() {
+                                        comp.set_nominal_capacity(total_cap);
+                                        info!(
+                                            "Autosized plant '{}' capacity: {:.0} W ({:.1} kW) from {} connected component(s) on '{}'",
+                                            name, total_cap, total_cap / 1000.0, connected.len(), pl.name
+                                        );
                                     }
                                 }
                             }
@@ -1826,6 +1995,11 @@ fn main() -> Result<()> {
 
         // ── 6b. Build VRF systems ──────────────────────────────────────────────
         use openbse_components::vrf::{VrfIndoorUnit, VrfOutdoorUnit};
+        // Zone sizing folds zone_multiplier into the peaks; an indoor unit serves
+        // one zone, so take it back out (building energy is multiplied later).
+        let vrf_zone_mult = |zone: &str| -> f64 {
+            (zone_multipliers.get(zone).copied().unwrap_or(1) as f64).max(1.0)
+        };
         let mut vrf_systems: Vec<(VrfOutdoorUnit, Vec<VrfIndoorUnit>)> = model
             .vrf_systems
             .iter()
@@ -1843,6 +2017,7 @@ fn main() -> Result<()> {
                                 .copied()
                                 .unwrap_or(3000.0)
                                 * model.simulation.cooling_sizing_factor
+                                / vrf_zone_mult(&iu.zone)
                         } else {
                             iu.cooling_capacity.to_f64()
                         }
@@ -1858,6 +2033,7 @@ fn main() -> Result<()> {
                                 .copied()
                                 .unwrap_or(3000.0)
                                 * model.simulation.heating_sizing_factor
+                                / vrf_zone_mult(&iu.zone)
                         } else {
                             iu.heating_capacity.to_f64()
                         }
@@ -1912,7 +2088,8 @@ fn main() -> Result<()> {
                                 .get(&iu_in.zone)
                                 .copied()
                                 .unwrap_or(3000.0)
-                                * model.simulation.cooling_sizing_factor)
+                                * model.simulation.cooling_sizing_factor
+                                / vrf_zone_mult(&iu_in.zone))
                                 .max(500.0)
                         } else {
                             iu_in.cooling_capacity.to_f64()
@@ -1922,7 +2099,8 @@ fn main() -> Result<()> {
                                 .get(&iu_in.zone)
                                 .copied()
                                 .unwrap_or(3000.0)
-                                * model.simulation.heating_sizing_factor)
+                                * model.simulation.heating_sizing_factor
+                                / vrf_zone_mult(&iu_in.zone))
                                 .max(500.0)
                         } else {
                             iu_in.heating_capacity.to_f64()
@@ -2533,6 +2711,13 @@ fn main() -> Result<()> {
                             })
                             .collect();
 
+                        // Zone air capacitance term of the heat balance
+                        // [W/K], for the VRF predictor loads below.
+                        let zone_cap_terms: HashMap<String, f64> = env
+                            .zones
+                            .iter()
+                            .map(|z| (z.input.name.clone(), 1.2 * z.input.volume * 1005.0 / dt))
+                            .collect();
                         for hvac_iter in 0..MAX_HVAC_ITER {
                             // Step 1: Run HVAC with current zone temps and loads
                             let (mut hvac_result, zone_supply_conditions) = simulate_all_loops(
@@ -3045,22 +3230,83 @@ fn main() -> Result<()> {
                             // VRF operates independently of the air-loop graph.
                             // The outdoor unit dispatches indoor units based on
                             // current zone temperatures and setpoints.
+                            // Load-based: each unit meets its zone's net load to
+                            // setpoint (ideal loads, refreshed every iteration), as
+                            // the air loops do. Temperature-band control hunted
+                            // inside a 0.5 K deadband and 5 K proportional band
+                            // and, with the per-iteration zone temperatures,
+                            // flipped between off and full heat (a mid-floor hotel
+                            // zone swung 20.8 -> 29.6 C in one hour).
+                            //
+                            // The ideal loads are "from the current iterate to
+                            // setpoint" (t_prev = iterate), which double-counts the
+                            // heat already delivered this step and makes the units
+                            // flip between off and full output. Correct them back to
+                            // the start-of-step temperature:
+                            //   Q(t_start) = Q(t_iter) + C_air × (t_iter − t_start)
+                            // which is the E+ predictor load with this iteration's
+                            // gains and surface temperatures.
+                            let mut vrf_heating_loads: HashMap<String, f64> = HashMap::new();
+                            let mut vrf_cooling_loads: HashMap<String, f64> = HashMap::new();
+                            for (_odu, idu_vec) in &vrf_systems {
+                                for iu in idu_vec.iter() {
+                                    let z = &iu.zone;
+                                    let q_iter =
+                                        current_heating_loads.get(z).copied().unwrap_or(0.0)
+                                            - current_cooling_loads.get(z).copied().unwrap_or(0.0);
+                                    let t_iter = current_zone_temps.get(z).copied().unwrap_or(21.0);
+                                    let t_start =
+                                        initial_zone_temps.get(z).copied().unwrap_or(t_iter);
+                                    let cap = zone_cap_terms.get(z).copied().unwrap_or(0.0);
+                                    let q = q_iter + cap * (t_iter - t_start);
+                                    vrf_heating_loads.insert(z.clone(), q.max(0.0));
+                                    vrf_cooling_loads.insert(z.clone(), (-q).max(0.0));
+                                }
+                            }
                             for (odu, idu_vec) in &mut vrf_systems {
-                                odu.coordinate(
+                                odu.coordinate_loads(
                                     idu_vec,
                                     t_outdoor,
-                                    &current_zone_temps,
-                                    &zone_heating_setpoints,
-                                    &zone_cooling_setpoints,
+                                    &initial_zone_temps,
+                                    &vrf_heating_loads,
+                                    &vrf_cooling_loads,
                                     ctx.outdoor_air.w,
                                 );
-                                // Record compressor energy in hvac_result outputs
-                                if odu.compressor_power > 0.0 {
-                                    hvac_result
-                                        .component_outputs
-                                        .entry(odu.name.clone())
-                                        .or_default()
-                                        .insert("electric_power".to_string(), odu.compressor_power);
+                                // Record compressor energy in hvac_result outputs.
+                                // Indoor units are sized for one zone each, so the
+                                // building-level compressor power is the
+                                // zone-multiplier-weighted sum of the unit shares.
+                                let building_power: f64 = idu_vec
+                                    .iter()
+                                    .map(|iu| {
+                                        iu.power
+                                            * zone_multipliers.get(&iu.zone).copied().unwrap_or(1)
+                                                as f64
+                                    })
+                                    .sum();
+                                let odu_out = hvac_result
+                                    .component_outputs
+                                    .entry(odu.name.clone())
+                                    .or_default();
+                                odu_out.insert("electric_power".to_string(), building_power);
+                                odu_out
+                                    .insert("compressor_power".to_string(), odu.compressor_power);
+                                odu_out.insert("total_cooling".to_string(), odu.total_cooling);
+                                odu_out.insert("total_heating".to_string(), odu.total_heating);
+                                for iu in idu_vec.iter() {
+                                    let mut o = HashMap::new();
+                                    let mode = match iu.mode {
+                                        openbse_components::vrf::VrfMode::Cooling => -1.0,
+                                        openbse_components::vrf::VrfMode::Heating => 1.0,
+                                        openbse_components::vrf::VrfMode::Off => 0.0,
+                                    };
+                                    o.insert("mode".to_string(), mode);
+                                    o.insert("plr".to_string(), iu.plr);
+                                    o.insert("mass_flow".to_string(), iu.mass_flow);
+                                    o.insert("outlet_temp".to_string(), iu.supply_temp);
+                                    o.insert("thermal_output".to_string(), iu.thermal_output);
+                                    o.insert("electric_power".to_string(), 0.0);
+                                    hvac_result.component_outputs.insert(iu.name.clone(), o);
                                 }
                             }
 
@@ -3424,7 +3670,21 @@ fn main() -> Result<()> {
                         let is_conditioned = zone.input.conditioned;
 
                         if has_setpoints && is_conditioned {
-                            let (heat_sp, cool_sp) = zone.input.active_setpoints(hour);
+                            // Judge unmet hours against the setpoints the HVAC is
+                            // actually holding. `active_setpoints` falls back to
+                            // the zone's ideal-loads values or to 20/27 °C when the
+                            // zone carries no thermostat schedule of its own, so a
+                            // thermostat-block 21/24 °C building was being scored
+                            // against 20/27 °C and read "0 unmet" at 19.5 °C.
+                            let (heat_sp, cool_sp) = if zone.input.thermostat_schedule.is_empty() {
+                                let (h, c) = zone.input.active_setpoints(hour);
+                                (
+                                    zone_heating_setpoints.get(&name).copied().unwrap_or(h),
+                                    zone_cooling_setpoints.get(&name).copied().unwrap_or(c),
+                                )
+                            } else {
+                                zone.input.active_setpoints(hour)
+                            };
                             snapshot.zone_heating_setpoint.insert(name.clone(), heat_sp);
                             snapshot.zone_cooling_setpoint.insert(name.clone(), cool_sp);
 
@@ -3631,6 +3891,31 @@ fn main() -> Result<()> {
                                     snapshot
                                         .heat_rejection_power
                                         .insert(comp_name.clone(), pw_m);
+                                }
+                                Some(ComponentKind::VrfOutdoor) => {
+                                    // One compressor serving both modes; split its
+                                    // power by delivered heating/cooling so it lands
+                                    // in Heating (Electric) / Cooling (Electric)
+                                    // (the summary buckets by name substring and a
+                                    // "VRF-ODU-1" matched neither).
+                                    let tc =
+                                        vars.get("total_cooling").copied().unwrap_or(0.0).max(0.0);
+                                    let th =
+                                        vars.get("total_heating").copied().unwrap_or(0.0).max(0.0);
+                                    let cool_share =
+                                        if tc + th > 0.0 { tc / (tc + th) } else { 1.0 };
+                                    let pc = pw_m * cool_share;
+                                    let ph = pw_m - pc;
+                                    if pc > 0.0 {
+                                        snapshot
+                                            .component_electric_power
+                                            .insert(format!("{} [vrf cooling]", comp_name), pc);
+                                    }
+                                    if ph > 0.0 {
+                                        snapshot
+                                            .component_electric_power
+                                            .insert(format!("{} [vrf heating]", comp_name), ph);
+                                    }
                                 }
                                 Some(ComponentKind::Gshp) => {
                                     // A GSHP is one compressor serving both modes.
@@ -3865,14 +4150,21 @@ fn main() -> Result<()> {
                             // GSHP power is keyed "<name> [gshp heating|cooling]" (see
                             // snapshot population); strip the suffix for kind/submeter
                             // lookups and route by the mode it ran in.
-                            let gshp_mode = if comp_name.ends_with(" [gshp heating]") {
+                            let gshp_mode = if comp_name.ends_with(" [gshp heating]")
+                                || comp_name.ends_with(" [vrf heating]")
+                            {
                                 Some("heating_electric")
-                            } else if comp_name.ends_with(" [gshp cooling]") {
+                            } else if comp_name.ends_with(" [gshp cooling]")
+                                || comp_name.ends_with(" [vrf cooling]")
+                            {
                                 Some("cooling_electric")
                             } else {
                                 None
                             };
-                            let base_name: &str = match comp_name.rfind(" [gshp ") {
+                            let base_name: &str = match comp_name
+                                .rfind(" [gshp ")
+                                .or_else(|| comp_name.rfind(" [vrf "))
+                            {
                                 Some(i) if gshp_mode.is_some() => &comp_name[..i],
                                 _ => comp_name.as_str(),
                             };
@@ -4092,6 +4384,31 @@ fn main() -> Result<()> {
                                     snapshot
                                         .heat_rejection_power
                                         .insert(comp_name.clone(), pw_m);
+                                }
+                                Some(ComponentKind::VrfOutdoor) => {
+                                    // One compressor serving both modes; split its
+                                    // power by delivered heating/cooling so it lands
+                                    // in Heating (Electric) / Cooling (Electric)
+                                    // (the summary buckets by name substring and a
+                                    // "VRF-ODU-1" matched neither).
+                                    let tc =
+                                        vars.get("total_cooling").copied().unwrap_or(0.0).max(0.0);
+                                    let th =
+                                        vars.get("total_heating").copied().unwrap_or(0.0).max(0.0);
+                                    let cool_share =
+                                        if tc + th > 0.0 { tc / (tc + th) } else { 1.0 };
+                                    let pc = pw_m * cool_share;
+                                    let ph = pw_m - pc;
+                                    if pc > 0.0 {
+                                        snapshot
+                                            .component_electric_power
+                                            .insert(format!("{} [vrf cooling]", comp_name), pc);
+                                    }
+                                    if ph > 0.0 {
+                                        snapshot
+                                            .component_electric_power
+                                            .insert(format!("{} [vrf heating]", comp_name), ph);
+                                    }
                                 }
                                 Some(ComponentKind::Gshp) => {
                                     // A GSHP is one compressor serving both modes.
@@ -5243,9 +5560,13 @@ fn simulate_all_loops(
                         10000.0
                     };
 
-                    // Zone cooling load from the heat balance (multiplied for zone_multiplier)
-                    let zone_cool_load = zone_cooling_loads.get(zone_name).copied().unwrap_or(0.0)
-                        * zone_multipliers.get(zone_name).copied().unwrap_or(1) as f64;
+                    // Zone cooling load from the heat balance. Per zone, NOT
+                    // multiplied by zone_multiplier: the terminal box serves one
+                    // zone and its energy is multiplied afterwards
+                    // (comp_zone_multiplier). Multiplying here made every
+                    // multiplied mid-floor zone ask for twice its cooling and
+                    // sit 1 K below its heating setpoint all afternoon.
+                    let zone_cool_load = zone_cooling_loads.get(zone_name).copied().unwrap_or(0.0);
 
                     // Get VAV box max flow for load-based signal
                     let vav_max_flow = zone_design_flows
@@ -5288,8 +5609,16 @@ fn simulate_all_loops(
                     };
 
                     if let Some(node_idx) = graph.node_by_name(term_name) {
-                        // Set control signal on the terminal box
+                        // Set control signal on the terminal box, and the zone
+                        // temperature it must lift the cold primary air to.
                         if let GraphComponent::Air(component) = graph.component_mut(node_idx) {
+                            component.set_zone_temp(zone_temp_init);
+                            // Signed net load to setpoint. A VAV box uses it to
+                            // temper minimum-flow air when the zone needs less
+                            // cooling than that air provides — the state the
+                            // mode/signal pair below cannot express (zone below
+                            // heating setpoint with a zero ideal heating load).
+                            component.set_zone_load(zone_heat_load - zone_cool_load);
                             component.set_setpoint(control_signal);
                         }
                         // Use per-zone design flow as terminal inlet. The terminal
