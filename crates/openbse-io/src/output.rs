@@ -3517,6 +3517,8 @@ mod tests {
         // Zone at 19.0 C (below 20.0 - 0.2 = 19.8 C tolerance)
         let mut snap = OutputSnapshot::new(1, 1, 1, 1, 3600.0);
         snap.zone_temperature.insert("Zone1".to_string(), 19.0);
+        snap.zone_gain_people_sensible
+            .insert("Zone1".to_string(), 75.0); // occupied
         snap.zone_heating_rate.insert("Zone1".to_string(), 0.0);
         snap.zone_cooling_rate.insert("Zone1".to_string(), 0.0);
         report.add_snapshot(&snap);
@@ -3526,6 +3528,9 @@ mod tests {
         // Zone at 19.9 C (above 19.8 C tolerance -- NOT unmet)
         let mut snap2 = OutputSnapshot::new(1, 1, 2, 1, 3600.0);
         snap2.zone_temperature.insert("Zone1".to_string(), 19.9);
+        snap2
+            .zone_gain_people_sensible
+            .insert("Zone1".to_string(), 75.0); // occupied
         snap2.zone_heating_rate.insert("Zone1".to_string(), 0.0);
         snap2.zone_cooling_rate.insert("Zone1".to_string(), 0.0);
         report.add_snapshot(&snap2);

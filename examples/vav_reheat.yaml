@@ -12,8 +12,8 @@
 # Systems:
 #   - VAV AHU: VAV fan + CHW cooling coil + HHW preheat coil
 #     Supply air: 13C cooling setpoint, 35C heating setpoint
-#   - Zone VAV boxes with electric reheat (modeled as zone-level electric coils)
-#   - HHW plant loop: natural gas boiler (AHU preheat)
+#   - Zone VAV boxes (vav_box terminals) with hot-water reheat
+#   - HHW plant loop: natural gas boiler (AHU preheat + terminal reheat)
 #   - CHW plant loop: air-cooled chiller (AHU cooling)
 #
 # Weather: Boulder, CO TMYx
@@ -620,6 +620,7 @@ air_loops:
         source: hot_water
         capacity: autosize
         setpoint: 35.0
+        plant_loop: HHW Loop
 
       - type: cooling_coil
         name: AHU CHW Cooling Coil
@@ -631,62 +632,45 @@ air_loops:
 
     zone_terminals:
       - zone: South Perimeter
+        terminal:
+          type: vav_box
+          name: VAV Box SP
+          max_air_flow: autosize
+          min_flow_fraction: 0.30
+          reheat_type: hot_water
+          reheat_capacity: autosize
+          max_reheat_temp: 40.0
+          plant_loop: HHW Loop
       - zone: North Perimeter
+        terminal:
+          type: vav_box
+          name: VAV Box NP
+          max_air_flow: autosize
+          min_flow_fraction: 0.30
+          reheat_type: hot_water
+          reheat_capacity: autosize
+          max_reheat_temp: 40.0
+          plant_loop: HHW Loop
       - zone: Core
+        terminal:
+          type: vav_box
+          name: VAV Box Core
+          max_air_flow: autosize
+          min_flow_fraction: 0.30
+          reheat_type: hot_water
+          reheat_capacity: autosize
+          max_reheat_temp: 40.0
+          plant_loop: HHW Loop
       - zone: Conference
-
-# --- Zone VAV Terminal Reheat Boxes ---
-# Each zone has an FCU-type loop acting as a zone terminal reheat box.
-# The reheat coil fires in heating mode (zone below heating setpoint).
-# These loops recirculate the supply air already delivered by the VAV AHU.
-
-  - name: VAV Box SP
-    system_type: fcu          # Zone-level reheat box
-    equipment:
-      - type: heating_coil
-        name: SP Reheat Coil
-        source: electric   # Electric reheat
-        capacity: autosize
-        setpoint: 35.0
-        efficiency: 1.0
-    zone_terminals:
-      - zone: South Perimeter
-
-  - name: VAV Box NP
-    system_type: fcu
-    equipment:
-      - type: heating_coil
-        name: NP Reheat Coil
-        source: electric
-        capacity: autosize
-        setpoint: 35.0
-        efficiency: 1.0
-    zone_terminals:
-      - zone: North Perimeter
-
-  - name: VAV Box Core
-    system_type: fcu
-    equipment:
-      - type: heating_coil
-        name: Core Reheat Coil
-        source: electric
-        capacity: autosize
-        setpoint: 35.0
-        efficiency: 1.0
-    zone_terminals:
-      - zone: Core
-
-  - name: VAV Box Conf
-    system_type: fcu
-    equipment:
-      - type: heating_coil
-        name: Conf Reheat Coil
-        source: electric
-        capacity: autosize
-        setpoint: 35.0
-        efficiency: 1.0
-    zone_terminals:
-      - zone: Conference
+        terminal:
+          type: vav_box
+          name: VAV Box Conf
+          max_air_flow: autosize
+          min_flow_fraction: 0.30
+          reheat_type: hot_water
+          reheat_capacity: autosize
+          max_reheat_temp: 40.0
+          plant_loop: HHW Loop
 
 # --- Plant Loops ---
 plant_loops:

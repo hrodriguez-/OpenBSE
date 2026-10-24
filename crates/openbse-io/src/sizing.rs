@@ -553,8 +553,15 @@ fn run_zone_sizing(
         let heat_sp = zone_heating_setpoints.get(name).copied().unwrap_or(21.0);
         let cool_sp = zone_cooling_setpoints.get(name).copied().unwrap_or(24.0);
 
-        let heat_load = zone_peak_heating.get(name).copied().unwrap_or(0.0);
-        let cool_load_raw = zone_peak_cooling.get(name).copied().unwrap_or(0.0);
+        // Zone design airflows carry the sizing factors (E+ Sizing:Zone
+        // "Zone Heating/Cooling Sizing Factor", ASHRAE 90.1 App. G 1.25/1.15):
+        // a terminal sized to the bare design-day peak is at 100 % flow on the
+        // design day and short on every hour the annual weather exceeds it.
+        // The stored peak loads stay unfactored; callers factor them where
+        // they size capacities.
+        let heat_load = zone_peak_heating.get(name).copied().unwrap_or(0.0) * heating_sizing_factor;
+        let cool_load_raw =
+            zone_peak_cooling.get(name).copied().unwrap_or(0.0) * cooling_sizing_factor;
 
         // Heating airflow: Q = m_dot * Cp * (T_supply - T_zone)
         let dt_heating = (heating_supply_temp - heat_sp).max(5.0);
@@ -597,7 +604,7 @@ fn run_zone_sizing(
             0.0
         };
 
-        let cool_load = cool_load_raw + q_oa;
+        let cool_load = cool_load_raw + q_oa * cooling_sizing_factor;
         //
         // sizing_fan_delta_t (from SimulationSettings) adds the fan heat
         // temperature rise to the cooling supply temp during sizing only.
