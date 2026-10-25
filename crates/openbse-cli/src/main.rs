@@ -1223,6 +1223,14 @@ fn main() -> Result<()> {
                 let global_cool_sat = supply_temps.map(|t| t.1).unwrap_or(13.0);
                 let cp_air_sz = 1005.0_f64;
                 for li in &loop_infos {
+                    // A DOAS delivers ventilation air, not the zone cooling
+                    // load: its warm SAT must not inflate the zone design flows
+                    // (which the zone's own fan-coil loop and the DOAS fan
+                    // then both use — the hospital DOAS ran 22 kg/s instead of
+                    // 13 and its preheat coil, sized for 13, left 12 C air).
+                    if li.system_type == AirLoopSystemType::Doas {
+                        continue;
+                    }
                     if (li.cooling_supply_temp - global_cool_sat).abs() > 0.5 {
                         for zone_name in &li.served_zones {
                             let cool_sp = resolved_thermostats
@@ -1303,7 +1311,44 @@ fn main() -> Result<()> {
                             // zone_factor (Sizing:Parameters) inflates zone loads
                             // system_capacity_factor (Sizing:System FractionOfAutosized) adds
                             // additional system-level oversizing on top.
-                            let zone_heat: f64 = li
+                            // The zone peak excludes outdoor air (zone sizing
+                            // leaves OA to the system); a PSZ coil heats the
+                            // mixed air, so add the OA load at the heating design
+                            // temperature or the furnace cannot even lift the
+                            // mixed air to setpoint at full airflow (a school
+                            // classroom unit came out at 9 kW and delivered 0.6 kW
+                            // all winter morning).
+                            let t_oa_heat = model
+                                .design_days
+                                .iter()
+                                .filter(|dd| {
+                                    dd.day_type.to_lowercase().contains("heat")
+                                        || dd.day_type.to_lowercase().contains("winter")
+                                })
+                                .map(|dd| dd.design_temp)
+                                .fold(f64::INFINITY, f64::min);
+                            let t_oa_heat = if t_oa_heat.is_finite() {
+                                t_oa_heat
+                            } else {
+                                -10.0
+                            };
+                            let heat_sp_avg = {
+                                let v: Vec<f64> = li
+                                    .served_zones
+                                    .iter()
+                                    .filter_map(|z| zone_heating_setpoints.get(z).copied())
+                                    .collect();
+                                if v.is_empty() {
+                                    21.0
+                                } else {
+                                    v.iter().sum::<f64>() / v.len() as f64
+                                }
+                            };
+                            let oa_heat_load = zone_airflow
+                                * li.min_oa_fraction.clamp(0.0, 1.0)
+                                * 1005.0
+                                * (heat_sp_avg - t_oa_heat).max(0.0);
+                            let zone_heat: f64 = (li
                                 .served_zones
                                 .iter()
                                 .map(|z| {
@@ -1314,8 +1359,60 @@ fn main() -> Result<()> {
                                         .unwrap_or(0.0)
                                 })
                                 .sum::<f64>()
+                                + oa_heat_load)
                                 * model.simulation.heating_sizing_factor;
-                            let zone_cool: f64 = li
+                            // Cooling: the zone peak is sensible and excludes
+                            // outdoor air. Add the OA load at the cooling design
+                            // temperature and convert to the coil's total
+                            // capacity with its sensible heat ratio (a DX coil
+                            // sized to the sensible peak as "total" delivers only
+                            // SHR x that sensible — the school units topped out at
+                            // 13.5 kW sensible against a 12 kW room load).
+                            let t_oa_cool = model
+                                .design_days
+                                .iter()
+                                .filter(|dd| {
+                                    !(dd.day_type.to_lowercase().contains("heat")
+                                        || dd.day_type.to_lowercase().contains("winter"))
+                                })
+                                .map(|dd| dd.design_temp)
+                                .fold(f64::NEG_INFINITY, f64::max);
+                            let t_oa_cool = if t_oa_cool.is_finite() {
+                                t_oa_cool
+                            } else {
+                                33.0
+                            };
+                            let cool_sp_avg = {
+                                let v: Vec<f64> = li
+                                    .served_zones
+                                    .iter()
+                                    .filter_map(|z| zone_cooling_setpoints.get(z).copied())
+                                    .collect();
+                                if v.is_empty() {
+                                    24.0
+                                } else {
+                                    v.iter().sum::<f64>() / v.len() as f64
+                                }
+                            };
+                            let oa_cool_load = zone_airflow
+                                * li.min_oa_fraction.clamp(0.0, 1.0)
+                                * 1005.0
+                                * (t_oa_cool - cool_sp_avg).max(0.0);
+                            let shr = model
+                                .air_loops
+                                .iter()
+                                .find(|al| al.name == li.name)
+                                .and_then(|al| {
+                                    al.equipment.iter().find_map(|eq| match eq {
+                                        openbse_io::input::EquipmentInput::CoolingCoil(c) => {
+                                            Some(c.shr)
+                                        }
+                                        _ => None,
+                                    })
+                                })
+                                .unwrap_or(1.0)
+                                .clamp(0.5, 1.0);
+                            let zone_cool: f64 = (li
                                 .served_zones
                                 .iter()
                                 .map(|z| {
@@ -1326,6 +1423,8 @@ fn main() -> Result<()> {
                                         .unwrap_or(0.0)
                                 })
                                 .sum::<f64>()
+                                + oa_cool_load)
+                                / shr
                                 * model.simulation.cooling_sizing_factor;
                             (zone_flow_m3, zone_heat, zone_cool)
                         }
@@ -1537,7 +1636,25 @@ fn main() -> Result<()> {
                             let zone_heat = (zone_peak_heat
                                 * model.simulation.heating_sizing_factor)
                                 .max(coil_heat_cap);
-                            let zone_cool = (zone_peak_cool
+                            // The zone peak is sensible; the coil's capacity is total.
+                            // Convert with the rated sensible heat ratio (a wet coil
+                            // in a 55 % RH ward delivered 0.58 of its total as
+                            // sensible and sat 2 K over setpoint at 87 % load).
+                            let shr = model
+                                .air_loops
+                                .iter()
+                                .find(|al| al.name == li.name)
+                                .and_then(|al| {
+                                    al.equipment.iter().find_map(|eq| match eq {
+                                        openbse_io::input::EquipmentInput::CoolingCoil(c) => {
+                                            Some(c.shr)
+                                        }
+                                        _ => None,
+                                    })
+                                })
+                                .unwrap_or(1.0)
+                                .clamp(0.5, 1.0);
+                            let zone_cool = (zone_peak_cool / shr
                                 * model.simulation.cooling_sizing_factor)
                                 .max(coil_cool_cap);
 
@@ -3365,8 +3482,29 @@ fn main() -> Result<()> {
                                 }
                             }
                             // Pass setpoints so envelope can compute ideal loads at setpoint
-                            hvac_conds.cooling_setpoints = zone_cooling_setpoints.clone();
-                            hvac_conds.heating_setpoints = zone_heating_setpoints.clone();
+                            // Setback: zones whose loop is off-schedule this
+                            // timestep are controlled (night cycle) to the
+                            // unoccupied setpoints, so their ideal loads must
+                            // target those or the units would heat to the day
+                            // setpoint all night.
+                            let mut env_cool_sp = zone_cooling_setpoints.clone();
+                            let mut env_heat_sp = zone_heating_setpoints.clone();
+                            for li in &loop_infos {
+                                if let Some(ref sched_name) = li.availability_schedule {
+                                    if env.schedule_manager.fraction(sched_name, hour, dow) < 0.5 {
+                                        for z in &li.served_zones {
+                                            if let Some(&v) = zone_unocc_cooling_setpoints.get(z) {
+                                                env_cool_sp.insert(z.clone(), v);
+                                            }
+                                            if let Some(&v) = zone_unocc_heating_setpoints.get(z) {
+                                                env_heat_sp.insert(z.clone(), v);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            hvac_conds.cooling_setpoints = env_cool_sp;
+                            hvac_conds.heating_setpoints = env_heat_sp;
 
                             // ── Radiant Panel Gains ───────────────────────────────
                             // Simulate radiant panels and accumulate their radiant and
@@ -4736,13 +4874,32 @@ fn simulate_all_loops(
         if let Some(ref sched_name) = li.availability_schedule {
             if let Some(mgr) = schedule_mgr {
                 let avail = mgr.fraction(sched_name, hour, day_of_week);
-                if avail < 0.5 {
-                    // System scheduled OFF — no night-cycle (matches E+
-                    // simplified model without AvailabilityManager:NightCycle).
-                    //
-                    // Night-cycle availability management is tracked as a
-                    // future feature in the README.
-                    nightcycle_timers.insert(li.name.clone(), 0.0);
+                // Night cycle (E+ AvailabilityManager:NightCycle, CycleOnAny):
+                // while the schedule is off, the system still starts when any
+                // served zone drifts `nightcycle_tolerance` past its unoccupied
+                // setpoints, then runs for `cycling_run_time` (at least one
+                // timestep) at the unoccupied setpoints with no outdoor air.
+                // Without it a setback building free-floats all night and the
+                // zone units face a cold soak at the morning start.
+                let now = ctx.timestep.sim_time_s;
+                let triggered = avail < 0.5
+                    && li.served_zones.iter().any(|z| {
+                        let t = zone_temps.get(z).copied().unwrap_or(21.0);
+                        let hs = zone_unocc_heat_sp.get(z).copied().unwrap_or(15.6);
+                        let cs = zone_unocc_cool_sp.get(z).copied().unwrap_or(29.4);
+                        t < hs - nightcycle_tolerance || t > cs + nightcycle_tolerance
+                    });
+                let running = nightcycle_timers
+                    .get(&li.name)
+                    .map(|&t_end| now < t_end)
+                    .unwrap_or(false);
+                if avail < 0.5 && triggered {
+                    nightcycle_timers.insert(li.name.clone(), now + cycling_run_time.max(dt));
+                }
+                if avail < 0.5 && (triggered || running) {
+                    is_unoccupied = true;
+                } else if avail < 0.5 {
+                    // System scheduled OFF and no zone past its setback band.
                     for comp_name in &li.component_names {
                         let mut comp_outputs = HashMap::new();
                         comp_outputs.insert("outlet_temperature".to_string(), t_outdoor);
@@ -4927,17 +5084,22 @@ fn simulate_all_loops(
 
                 // Primary: use predictor temps (E+-style free-floating prediction)
                 // This uses CURRENT timestep conditions, not stale loads.
-                let mode = if let Some(&t_predicted) = predictor_no_hvac_temps.get(z.as_str()) {
-                    if t_predicted < hsp {
-                        HvacMode::Heating
-                    } else if t_predicted > csp {
-                        HvacMode::Cooling
-                    } else {
-                        HvacMode::Deadband
-                    }
-                }
-                // Fallback: ideal loads (first iteration before envelope runs)
-                else if hload > 10.0 && hload > cload {
+                // Mode from the zone's net load to setpoint, corrected from the
+                // current iterate back to the start-of-step temperature
+                // (Q(t_start) = Q(t_iter) + C_air (t_iter − t_start)). This is
+                // iteration-invariant to first order, so the mode no longer flips
+                // between HVAC iterations; the frozen no-HVAC prediction it
+                // replaces lagged a step and left units idle at 24.3 C one
+                // quarter-hour and over-cooling to 23.5 C the next.
+                let t_start = initial_zone_temps.get(z).copied().unwrap_or(zt);
+                let cap = zone_thermal_caps.get(z).copied().unwrap_or(0.0);
+                let q_pred = (hload - cload) + cap * (zt - t_start);
+                let _ = predictor_no_hvac_temps;
+                let mode = if q_pred > 50.0 {
+                    HvacMode::Heating
+                } else if q_pred < -50.0 {
+                    HvacMode::Cooling
+                } else if hload > 10.0 && hload > cload {
                     HvacMode::Heating
                 } else if cload > 10.0 && cload > hload {
                     HvacMode::Cooling
@@ -5363,7 +5525,12 @@ fn simulate_all_loops(
 
                 match mode {
                     HvacMode::Heating => {
-                        let q_capacity = supply_flow * cp_air * (supply_temp - heat_sp);
+                        // Capacity relative to the zone, not the setpoint: a coil
+                        // whose outlet sits between zone temperature and setpoint
+                        // still heats the zone and must run (treating it as "cannot
+                        // reach setpoint → off" left a 13 C classroom unheated).
+                        let q_capacity =
+                            supply_flow * cp_air * (supply_temp - control_temp.min(heat_sp));
                         if control_temp > heat_sp + dead_band * 0.5 {
                             // Zone well above heating setpoint (e.g., setpoint
                             // transition to unoccupied).  Stale ideal load is
@@ -5374,7 +5541,10 @@ fn simulate_all_loops(
                         } else {
                             // Correct frozen ideal load for zone temp changes
                             // during HVAC iteration.
-                            let correction = zone_cap * (init_temp - control_temp);
+                            // Start-of-step predictor: heat delivered during the
+                            // iteration raised the zone, so the load from the
+                            // start is the iterate's load plus C_air (t_iter − t_start).
+                            let correction = zone_cap * (control_temp - init_temp);
                             let corrected_load = (zone_heat_load + correction).max(0.0);
 
                             if corrected_load > 10.0 {
@@ -5390,7 +5560,8 @@ fn simulate_all_loops(
                         }
                     }
                     HvacMode::Cooling => {
-                        let q_capacity = supply_flow * cp_air * (cool_sp - supply_temp);
+                        let q_capacity =
+                            supply_flow * cp_air * (control_temp.max(cool_sp) - supply_temp);
                         if control_temp < cool_sp - dead_band * 0.5 {
                             // Zone well below cooling setpoint — do not cool.
                             effective_min_oa
@@ -5398,7 +5569,7 @@ fn simulate_all_loops(
                             effective_min_oa
                         } else {
                             // Correct frozen ideal load for zone temp changes
-                            let correction = zone_cap * (control_temp - init_temp);
+                            let correction = zone_cap * (init_temp - control_temp);
                             let corrected_load = (zone_cool_load + correction).max(0.0);
 
                             if corrected_load > 10.0 {
@@ -5990,7 +6161,7 @@ fn build_psz_signals(
                 // warm but not hot air; at large errors, full-fire to recover.
                 if lname.contains("heat")
                     || lname.contains("furnace")
-                    || lname.contains("hw")
+                    || (lname.contains("hw") && !lname.contains("chw"))
                     || lname.starts_with("hc ")
                     || lname.starts_with("hc_")
                 {
@@ -6014,7 +6185,7 @@ fn build_psz_signals(
                     signals.coil_setpoints.insert(name.clone(), cooling_coil_sp);
                 } else if lname.contains("heat")
                     || lname.contains("furnace")
-                    || lname.contains("hw")
+                    || (lname.contains("hw") && !lname.contains("chw"))
                     || lname.starts_with("hc ")
                     || lname.starts_with("hc_")
                 {
@@ -6024,7 +6195,7 @@ fn build_psz_signals(
             HvacMode::Deadband => {
                 if lname.contains("heat")
                     || lname.contains("furnace")
-                    || lname.contains("hw")
+                    || (lname.contains("hw") && !lname.contains("chw"))
                     || lname.starts_with("hc ")
                     || lname.starts_with("hc_")
                 {
@@ -6119,7 +6290,7 @@ fn build_doas_signals(
         let lname = name.to_lowercase();
         if lname.contains("heat")
             || lname.contains("preheat")
-            || lname.contains("hw")
+            || (lname.contains("hw") && !lname.contains("chw"))
             || lname.starts_with("hc ")
             || lname.starts_with("hc_")
         {
@@ -6321,7 +6492,7 @@ fn build_fcu_signals(
                     // OFF-period.  PLR sets the duty cycle.
                     if lname.contains("heat")
                         || lname.contains("reheat")
-                        || lname.contains("hw")
+                        || (lname.contains("hw") && !lname.contains("chw"))
                         || lname.starts_with("hc ")
                         || lname.starts_with("hc_")
                     {
@@ -6348,7 +6519,7 @@ fn build_fcu_signals(
                             .insert(name.clone(), li.cooling_supply_temp);
                     } else if lname.contains("heat")
                         || lname.contains("reheat")
-                        || lname.contains("hw")
+                        || (lname.contains("hw") && !lname.contains("chw"))
                         || lname.starts_with("hc ")
                         || lname.starts_with("hc_")
                     {
@@ -6358,7 +6529,7 @@ fn build_fcu_signals(
                 HvacMode::Deadband => {
                     if lname.contains("heat")
                         || lname.contains("reheat")
-                        || lname.contains("hw")
+                        || (lname.contains("hw") && !lname.contains("chw"))
                         || lname.starts_with("hc ")
                         || lname.starts_with("hc_")
                     {
@@ -6389,7 +6560,7 @@ fn build_fcu_signals(
                         .clamp(zone_temp.min(45.0), 45.0);
                     if lname.contains("heat")
                         || lname.contains("reheat")
-                        || lname.contains("hw")
+                        || (lname.contains("hw") && !lname.contains("chw"))
                         || lname.starts_with("hc ")
                         || lname.starts_with("hc_")
                     {
@@ -6421,7 +6592,7 @@ fn build_fcu_signals(
                         signals.coil_setpoints.insert(name.clone(), target);
                     } else if lname.contains("heat")
                         || lname.contains("reheat")
-                        || lname.contains("hw")
+                        || (lname.contains("hw") && !lname.contains("chw"))
                         || lname.starts_with("hc ")
                         || lname.starts_with("hc_")
                     {
@@ -6431,7 +6602,7 @@ fn build_fcu_signals(
                 HvacMode::Deadband => {
                     if lname.contains("heat")
                         || lname.contains("reheat")
-                        || lname.contains("hw")
+                        || (lname.contains("hw") && !lname.contains("chw"))
                         || lname.starts_with("hc ")
                         || lname.starts_with("hc_")
                     {
@@ -6824,7 +6995,7 @@ fn build_vav_signals(
             }
         } else if lname.contains("preheat")
             || lname.contains("heat")
-            || lname.contains("hw")
+            || (lname.contains("hw") && !lname.contains("chw"))
             || lname.starts_with("hc ")
             || lname.starts_with("hc_")
         {
@@ -7035,7 +7206,7 @@ fn build_dual_duct_signals(
                 signals.coil_setpoints.insert(name.clone(), 99.0);
             }
         } else if lname.contains("heat")
-            || lname.contains("hw")
+            || (lname.contains("hw") && !lname.contains("chw"))
             || lname.contains("preheat")
             || lname.starts_with("hc ")
             || lname.starts_with("hc_")
