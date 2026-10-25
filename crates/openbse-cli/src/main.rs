@@ -1145,7 +1145,7 @@ fn main() -> Result<()> {
                     None
                 };
 
-                let sizing_result = openbse_io::sizing::run_sizing(
+                let mut sizing_result = openbse_io::sizing::run_sizing(
                     env,
                     &model.design_days,
                     &resolved_thermostats,
@@ -1160,6 +1160,32 @@ fn main() -> Result<()> {
                     model.simulation.timesteps_per_hour,
                     model.simulation.sizing_fan_delta_t,
                 );
+
+                // Zone sizing folds zone_multiplier into the per-zone peaks and
+                // airflows (the CSV and the coincident system peaks keep the
+                // building totals). The simulation models ONE zone of each
+                // multiplied set and multiplies its energy afterwards
+                // (comp_zone_multiplier, VRF unit shares), so everything sized
+                // from the per-zone maps — terminal boxes, zone units, VRF
+                // indoor units, the design flows the controllers see — must be
+                // per zone. A x8 mid-floor fan-coil sized for the stack blew
+                // eight zones' airflow into one zone and overshot every hour.
+                for (zone, &m) in &zone_multipliers {
+                    let m = (m as f64).max(1.0);
+                    if m > 1.0 {
+                        for map in [
+                            &mut sizing_result.zone_peak_heating,
+                            &mut sizing_result.zone_peak_cooling,
+                            &mut sizing_result.zone_heating_airflow,
+                            &mut sizing_result.zone_cooling_airflow,
+                            &mut sizing_result.zone_design_airflow,
+                        ] {
+                            if let Some(v) = map.get_mut(zone) {
+                                *v /= m;
+                            }
+                        }
+                    }
+                }
 
                 // Store coincident peak demands for plant loop pump autosizing
                 coincident_peak_heating = sizing_result.system_sizing.coincident_peak_heating;
@@ -1182,13 +1208,11 @@ fn main() -> Result<()> {
                     })
                     .flat_map(|li| li.served_zones.iter().cloned())
                     .collect();
+                // (The cooling sizing factor is applied to the zone airflows in
+                // zone sizing itself; applying it again here squared it.)
+                let _ = &vav_zones;
                 for (zone_name, &flow) in &sizing_result.zone_design_airflow {
-                    let sized_flow = if vav_zones.contains(zone_name) {
-                        flow * model.simulation.cooling_sizing_factor
-                    } else {
-                        flow
-                    };
-                    zone_design_flows.insert(zone_name.clone(), sized_flow);
+                    zone_design_flows.insert(zone_name.clone(), flow);
                 }
 
                 // ── Per-loop cooling SAT override ──
@@ -1622,34 +1646,23 @@ fn main() -> Result<()> {
                                 // the reheat coil for the cold-deck lift); the
                                 // generic fallbacks below only fill what is still
                                 // autosize afterwards.
-                                // Zone sizing folds zone_multiplier into the peak
-                                // loads and airflows (system sizing wants the whole
-                                // stack); a terminal serves ONE zone, so divide it
-                                // back out or a x2 mid-floor box runs twice the
-                                // minimum flow and twice the reheat of its zone.
-                                let zmult =
-                                    zone_multipliers.get(zone_name).copied().unwrap_or(1) as f64;
-                                let zmult = zmult.max(1.0);
                                 let sizing = openbse_core::ports::TerminalSizing {
                                     design_flow: sizing_result
                                         .zone_design_airflow
                                         .get(zone_name)
                                         .copied()
-                                        .unwrap_or(0.1)
-                                        / zmult,
+                                        .unwrap_or(0.1),
                                     heating_flow: sizing_result
                                         .zone_heating_airflow
                                         .get(zone_name)
                                         .copied()
-                                        .unwrap_or(0.0)
-                                        / zmult,
+                                        .unwrap_or(0.0),
                                     peak_heating: sizing_result
                                         .zone_peak_heating
                                         .get(zone_name)
                                         .copied()
                                         .unwrap_or(0.0)
-                                        * model.simulation.heating_sizing_factor
-                                        / zmult,
+                                        * model.simulation.heating_sizing_factor,
                                     primary_supply_temp: li.cooling_supply_temp,
                                     heating_setpoint: zone_heating_setpoints
                                         .get(zone_name)
@@ -1675,8 +1688,7 @@ fn main() -> Result<()> {
                                         .zone_design_airflow
                                         .get(zone_name)
                                         .copied()
-                                        .unwrap_or(0.1)
-                                        / zmult;
+                                        .unwrap_or(0.1);
                                     // Set in kg/s — terminal boxes use max_air_flow as mass flow
                                     // (compared against inlet.mass_flow in kg/s), unlike fans
                                     // which use design_flow_rate in m³/s.
@@ -1695,8 +1707,7 @@ fn main() -> Result<()> {
                                             .get(zone_name)
                                             .copied()
                                             .unwrap_or(0.0)
-                                            * model.simulation.heating_sizing_factor
-                                            / zmult;
+                                            * model.simulation.heating_sizing_factor;
                                         comp.set_nominal_capacity(zone_heat);
                                         info!("Autosized terminal '{}' reheat capacity: {:.0} W ({:.1} kW)",
                                         term_name, zone_heat, zone_heat / 1000.0);
@@ -1995,11 +2006,6 @@ fn main() -> Result<()> {
 
         // ── 6b. Build VRF systems ──────────────────────────────────────────────
         use openbse_components::vrf::{VrfIndoorUnit, VrfOutdoorUnit};
-        // Zone sizing folds zone_multiplier into the peaks; an indoor unit serves
-        // one zone, so take it back out (building energy is multiplied later).
-        let vrf_zone_mult = |zone: &str| -> f64 {
-            (zone_multipliers.get(zone).copied().unwrap_or(1) as f64).max(1.0)
-        };
         let mut vrf_systems: Vec<(VrfOutdoorUnit, Vec<VrfIndoorUnit>)> = model
             .vrf_systems
             .iter()
@@ -2017,7 +2023,6 @@ fn main() -> Result<()> {
                                 .copied()
                                 .unwrap_or(3000.0)
                                 * model.simulation.cooling_sizing_factor
-                                / vrf_zone_mult(&iu.zone)
                         } else {
                             iu.cooling_capacity.to_f64()
                         }
@@ -2033,7 +2038,6 @@ fn main() -> Result<()> {
                                 .copied()
                                 .unwrap_or(3000.0)
                                 * model.simulation.heating_sizing_factor
-                                / vrf_zone_mult(&iu.zone)
                         } else {
                             iu.heating_capacity.to_f64()
                         }
@@ -2088,8 +2092,7 @@ fn main() -> Result<()> {
                                 .get(&iu_in.zone)
                                 .copied()
                                 .unwrap_or(3000.0)
-                                * model.simulation.cooling_sizing_factor
-                                / vrf_zone_mult(&iu_in.zone))
+                                * model.simulation.cooling_sizing_factor)
                                 .max(500.0)
                         } else {
                             iu_in.cooling_capacity.to_f64()
@@ -2099,8 +2102,7 @@ fn main() -> Result<()> {
                                 .get(&iu_in.zone)
                                 .copied()
                                 .unwrap_or(3000.0)
-                                * model.simulation.heating_sizing_factor
-                                / vrf_zone_mult(&iu_in.zone))
+                                * model.simulation.heating_sizing_factor)
                                 .max(500.0)
                         } else {
                             iu_in.heating_capacity.to_f64()
@@ -4975,6 +4977,25 @@ fn simulate_all_loops(
             }
         }
 
+        // Zone loads for the single-zone builders, corrected from the current iterate back to the
+        // start-of-step temperature, Q(t_start) = Q(t_iter) + C_air (t_iter −
+        // t_start): the ideal load is "from the iterate to setpoint" and
+        // double-counts heat already delivered this step, so a unit acting on
+        // it flips on/off between iterations and whichever iteration runs last
+        // decides the hour (the hospital fan-coils idled at 24.4 C one hour and
+        // ran flat out to 23.7 C the next, all year).
+        let mut zone_heating_loads_mult: HashMap<String, f64> = HashMap::new();
+        let mut zone_cooling_loads_mult: HashMap<String, f64> = HashMap::new();
+        for z in &li.served_zones {
+            let q_iter = zone_heating_loads.get(z).copied().unwrap_or(0.0)
+                - zone_cooling_loads.get(z).copied().unwrap_or(0.0);
+            let t_iter = zone_temps.get(z).copied().unwrap_or(21.0);
+            let t_start = initial_zone_temps.get(z).copied().unwrap_or(t_iter);
+            let cap = zone_thermal_caps.get(z).copied().unwrap_or(0.0);
+            let q = q_iter + cap * (t_iter - t_start);
+            zone_heating_loads_mult.insert(z.clone(), q.max(0.0));
+            zone_cooling_loads_mult.insert(z.clone(), (-q).max(0.0));
+        }
         let mut signals = match li.system_type {
             // ──────────────────────────────────────────────────────────────
             // PSZ-AC: single-zone thermostat, mixed return + outdoor air.
@@ -4987,8 +5008,8 @@ fn simulate_all_loops(
                 active_cool_sp,
                 zone_design_flows,
                 t_outdoor,
-                zone_cooling_loads,
-                zone_heating_loads,
+                &zone_cooling_loads_mult,
+                &zone_heating_loads_mult,
                 effective_min_oa,
                 &predictor_modes,
                 w_outdoor,
@@ -5021,8 +5042,8 @@ fn simulate_all_loops(
                     active_cool_sp,
                     zone_design_flows,
                     t_outdoor,
-                    zone_heating_loads,
-                    zone_cooling_loads,
+                    &zone_heating_loads_mult,
+                    &zone_cooling_loads_mult,
                     &predictor_modes,
                     zone_humidity_ratios,
                     zone_max_rh,
@@ -5271,7 +5292,10 @@ fn simulate_all_loops(
             // Zone multiplier: equipment is sized for multiplied load, so the
             // PLR numerator (zone demand) must also be multiplied to get the
             // correct fraction of coil/fan capacity used.
-            let zmult_plr = zone_multipliers.get(control_zone).copied().unwrap_or(1) as f64;
+            // Zone units are sized per zone (sizing_result is per zone), so the
+            // zone load is compared with capacity unmultiplied; the energy is
+            // multiplied afterwards via comp_zone_multiplier.
+            let zmult_plr = 1.0_f64;
             let zone_cool_load =
                 zone_cooling_loads.get(control_zone).copied().unwrap_or(0.0) * zmult_plr;
             let zone_heat_load =
@@ -5850,8 +5874,21 @@ fn build_psz_signals(
     let heating_dat = match li.cycling {
         openbse_io::input::CyclingMethod::OnOff => li.heating_supply_temp,
         openbse_io::input::CyclingMethod::Proportional => {
+            // Lift the supply so full-flow delivery meets the zone's net
+            // load to setpoint. The error ramp alone (0 → max over 5 K)
+            // settles with a steady offset: at 0.5 K under setpoint it
+            // lifts the supply 10 % of the way and the zone stays there
+            // (the GSHP example sat 0.2–0.8 K low for 1,400 h). Kept as a
+            // floor for stale loads.
             let error = (heat_sp - control_temp).max(0.0);
-            (heat_sp + (li.heating_supply_temp - heat_sp) * (error / 5.0).min(1.0))
+            let dat_ramp = heat_sp + (li.heating_supply_temp - heat_sp) * (error / 5.0).min(1.0);
+            let dat_load = if control_temp < heat_sp + 0.1 {
+                control_temp + zone_heat_load.max(0.0) / (flow * 1005.0).max(1e-6)
+            } else {
+                heat_sp
+            };
+            dat_load
+                .max(dat_ramp)
                 .clamp(heat_sp, li.heating_supply_temp)
         }
     };
@@ -6147,6 +6184,31 @@ fn build_fcu_signals(
         .copied()
         .unwrap_or_else(|| hvac_mode(zone_temp, heat_sp, cool_sp));
 
+    // The predictor mode is frozen from the previous timestep's loads. When
+    // it says Deadband but the zone has already crossed the band this hour,
+    // act on the zone: left alone, a fan-coil zone alternated between an
+    // idle hour at 24.4 C and a full-cooling hour at 23.7 C all year (the
+    // hospital model logged 8,559 unmet cooling hours that way).
+    if li.system_type == AirLoopSystemType::Fcu {
+        // Fan-coil: mode from the (predictor-corrected) zone load, like the VAV
+        // box and VRF units, so it lands on setpoint instead of hunting.
+        let heat_load = zone_heating_loads.get(zone_name).copied().unwrap_or(0.0);
+        let cool_load = zone_cooling_loads.get(zone_name).copied().unwrap_or(0.0);
+        mode = if heat_load > 50.0 && heat_load >= cool_load {
+            HvacMode::Heating
+        } else if cool_load > 50.0 {
+            HvacMode::Cooling
+        } else {
+            HvacMode::Deadband
+        };
+    } else if mode == HvacMode::Deadband {
+        if zone_temp > cool_sp + 0.05 {
+            mode = HvacMode::Cooling;
+        } else if zone_temp < heat_sp - 0.05 {
+            mode = HvacMode::Heating;
+        }
+    }
+
     // RH override: if zone is over-humid and in deadband, force Cooling so the
     // DX coil activates and dehumidifies.
     let zone_w_fcu = zone_humidity_ratios
@@ -6193,18 +6255,37 @@ fn build_fcu_signals(
             _ => design_flow,
         }
     } else {
-        // FCU modulates fan speed: deadband = 20%, heating/cooling = proportional
+        // FCU modulates fan speed: deadband = 20%; heating/cooling at least the
+        // speed that carries the zone's net load at the coil's limiting supply
+        // temperature (45 C / 12 C), never below 30 % nor above design. The
+        // error ramp (30 -> 100 % over 5 K) stays as a floor; on its own it
+        // settled with the zone a fraction of a degree outside the band.
+        let cp = 1005.0_f64;
+        let heat_load = zone_heating_loads
+            .get(zone_name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        let cool_load = zone_cooling_loads
+            .get(zone_name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
         match mode {
             HvacMode::Deadband => design_flow * 0.20,
             HvacMode::Heating => {
                 let error = (heat_sp - zone_temp).clamp(0.0, 5.0);
-                let frac = 0.30 + 0.70 * (error / 5.0); // 30-100% of design
-                design_flow * frac
+                let frac_ramp = 0.30 + 0.70 * (error / 5.0);
+                let frac_load =
+                    heat_load / (cp * (45.0 - zone_temp).max(1.0) * design_flow.max(1e-6));
+                design_flow * frac_ramp.max(frac_load).clamp(0.30, 1.0)
             }
             HvacMode::Cooling => {
                 let error = (zone_temp - cool_sp).clamp(0.0, 5.0);
-                let frac = 0.30 + 0.70 * (error / 5.0); // 30-100% of design
-                design_flow * frac
+                let frac_ramp = 0.30 + 0.70 * (error / 5.0);
+                let frac_load =
+                    cool_load / (cp * (zone_temp - 12.0).max(1.0) * design_flow.max(1e-6));
+                design_flow * frac_ramp.max(frac_load).clamp(0.30, 1.0)
             }
         }
     };
@@ -6295,8 +6376,17 @@ fn build_fcu_signals(
             // FCU: proportional modulation
             match mode {
                 HvacMode::Heating => {
+                    // Supply temperature that meets the zone's net load at the
+                    // modulated airflow; the 1 K-per-K error ramp alone left
+                    // the zone a fraction of a degree under setpoint for good.
                     let error = heat_sp - zone_temp;
-                    let target = (heat_sp + error.min(14.0)).clamp(heat_sp, 45.0);
+                    let heat_load = zone_heating_loads.get(zone_name).copied().unwrap_or(0.0);
+                    // Only while the zone is actually under setpoint: the mode is
+                    // the frozen predictor's and can lag a swing.
+                    let t_load = zone_temp + heat_load.max(0.0) / (flow * 1005.0).max(1e-6);
+                    let target = (heat_sp + error.min(14.0))
+                        .max(t_load)
+                        .clamp(zone_temp.min(45.0), 45.0);
                     if lname.contains("heat")
                         || lname.contains("reheat")
                         || lname.contains("hw")
@@ -6314,7 +6404,15 @@ fn build_fcu_signals(
                 }
                 HvacMode::Cooling => {
                     let error = zone_temp - cool_sp;
-                    let target = (cool_sp - error.min(10.0)).clamp(12.0, cool_sp);
+                    let cool_load = zone_cooling_loads.get(zone_name).copied().unwrap_or(0.0);
+                    // Only while the zone is actually over setpoint; a stale
+                    // Cooling mode on a cold zone must not blow 12 C air (the
+                    // hospital fan-coil model went 742 -> 3,048 unmet heating
+                    // hours when it did).
+                    let t_load = zone_temp - cool_load.max(0.0) / (flow * 1005.0).max(1e-6);
+                    let target = (cool_sp - error.min(10.0))
+                        .min(t_load)
+                        .clamp(12.0, zone_temp.max(12.0));
                     if lname.contains("cool")
                         || lname.contains("dx")
                         || lname.starts_with("cc ")
