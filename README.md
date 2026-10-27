@@ -102,7 +102,7 @@ The **desktop editor** (`openbse-editor`) is a Tauri + React app in `tools/edito
 - **Solar** — position (Spencer 1971), Perez 1990 anisotropic sky model (isotropic + circumsolar + horizon brightening, matching E+ AnisoSkyViewFactors), angular SHGC transmission (28-bin mapping per LBNL-2804E), FullExterior and FullInteriorAndExterior distribution with beam/diffuse split and VMULT redistribution
 - **External Shading** — overhangs and fins with geometric beam shadow calculation (Sutherland-Hodgman polygon clipping), diffuse sky view factor reduction, 8x8 grid sampling for multi-caster union, Suncast-style solar precompute with disk-cached `.solar` files
 - **Sky Longwave Radiation** — Clark & Allen sky emissivity model with cloud cover correction (E+ default sky model)
-- **Interior Longwave Radiation** — MRT-based surface radiation exchange
+- **Interior Longwave Radiation** — EnergyPlus-style grey interchange (ScriptF): approximate view factors with reciprocity enforcement and Gebhart inter-reflections, per zone over all surfaces
 - **Infiltration** — EnergyPlus design flow rate model with wind dependence, ASHRAE combined infiltration model, multizone pressure network solver (Newton-Raphson with auto-generated cracks, Swami & Chandra Cp, stack effect)
 - **Internal Gains** — people, lights, equipment with radiant/convective/lost fraction split
 - **Zone Air Balance** — 3rd-order backward difference predictor-corrector (matching E+ ZoneTempPredictorCorrector)
