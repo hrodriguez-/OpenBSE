@@ -1,0 +1,62 @@
+# Build + test any ci/** branch: fmt diff, clippy, tests, ASHRAE 140, and a
+# Windows openbse.exe artifact. For machines that can't run cargo locally.
+name: Branch build
+
+on:
+  push:
+    branches: ["ci/**"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format (report the diff instead of failing)
+        run: |
+          cargo fmt --all
+          git diff > fmt.diff
+          echo "fmt diff lines: $(wc -l < fmt.diff)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fmt-diff
+          path: fmt.diff
+      - name: Clippy
+        run: cargo clippy --workspace 2>&1 | tee clippy.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clippy
+          path: clippy.txt
+      - name: Tests
+        run: cargo test --workspace
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build release
+        run: cargo build --release
+      - name: ASHRAE 140 cases
+        run: |
+          for yaml in 140_tests/cases/ashrae140_case[0-9]*.yaml; do
+            ./target/release/openbse "$yaml" -w 140_tests/weather/725650TYCST.epw > /dev/null 2>&1 || echo "WARN: $yaml exited non-zero"
+          done
+      - name: ASHRAE 140 regression check
+        run: python3 140_tests/scripts/build_140_csv.py --ci
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --package openbse-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openbse-windows
+          path: target/release/openbse.exe
