@@ -1137,6 +1137,8 @@ impl BuildingEnvelope {
         //
         // Zones without vertex data fall back to area-weighted MRT.
         let mut zone_view_factors: Vec<Option<ZoneViewFactors>> = vec![None; zone_states.len()];
+        // Relative tolerance on each face's area vs the bounding box (2 %).
+        const BOX_FACE_AREA_TOL: f64 = 0.02;
 
         for (zi, zone) in zone_states.iter().enumerate() {
             // Collect all vertices in this zone (opaque + window)
@@ -1194,6 +1196,38 @@ impl BuildingEnvelope {
 
             if !all_classified {
                 log::warn!("Zone '{}': not all surfaces classified into box faces, using area-weighted MRT", zone.input.name);
+                continue;
+            }
+
+            // Box view factors are only valid for an axis-aligned rectangular
+            // box: each face's area must match the bounding box. A rotated,
+            // trapezoidal or L/U-shaped zone has a bounding box larger than
+            // its faces, and box view factors on its real face areas break
+            // reciprocity (A_i·F_ij ≠ A_j·F_ji), so the interior long-wave
+            // exchange no longer conserves energy (a U-shaped core lost
+            // ~100 kWh/m²/yr of heat this way against EnergyPlus).
+            let expected = {
+                let mut e = [0.0_f64; 6];
+                e[geometry::FACE_FLOOR] = box_l * box_w;
+                e[geometry::FACE_CEILING] = box_l * box_w;
+                e[geometry::FACE_SOUTH] = box_l * box_h;
+                e[geometry::FACE_NORTH] = box_l * box_h;
+                e[geometry::FACE_EAST] = box_w * box_h;
+                e[geometry::FACE_WEST] = box_w * box_h;
+                e
+            };
+            let is_box = (0..6).all(|f| {
+                (face_area[f] - expected[f]).abs() <= BOX_FACE_AREA_TOL * expected[f].max(1.0e-6)
+            });
+            if !is_box {
+                log::info!(
+                    "Zone '{}': not a rectangular box ({:.1}×{:.1}×{:.1}m bounding box, \
+                     face areas don't match), using reciprocal area-weighted exchange",
+                    zone.input.name,
+                    box_l,
+                    box_w,
+                    box_h,
+                );
                 continue;
             }
 
@@ -3811,6 +3845,32 @@ impl EnvelopeSolver for BuildingEnvelope {
                     }
                 }
 
+                // Reciprocity sums for the area-weighted fallback. With
+                // e_j = ε_j·A_j and S = Σ e_j, surface i exchanges with j
+                // through c_ij = e_j·½(1/(S−e_i) + 1/(S−e_j)), so
+                // A_i·c_ij = A_j·c_ji and the zone's interior long-wave
+                // exchange sums to zero. The one-sided weight e_j/(S−e_i)
+                // is not reciprocal and leaks heat when surface sizes differ.
+                // zone_recip = Σ e_j/(S−e_j), zone_recip_t = Σ e_j·T_j/(S−e_j).
+                let mut zone_recip: Vec<f64> = vec![0.0; self.zones.len()];
+                let mut zone_recip_t: Vec<f64> = vec![0.0; self.zones.len()];
+                for (zi, zone) in self.zones.iter().enumerate() {
+                    for &si in &zone.surface_indices {
+                        let s = &self.surfaces[si];
+                        let eps = if s.is_window {
+                            s.glass_emissivity
+                        } else {
+                            s.thermal_absorptance_inside
+                        };
+                        let e = eps * s.net_area;
+                        let rest = zone_sum_ea[zi] - e;
+                        if rest > 1.0e-10 {
+                            zone_recip[zi] += e / rest;
+                            zone_recip_t[zi] += e * s.temp_inside / rest;
+                        }
+                    }
+                }
+
                 // Solve each surface
                 for i in 0..self.surfaces.len() {
                     let pc = match &precomp[i] {
@@ -3820,8 +3880,11 @@ impl EnvelopeSolver for BuildingEnvelope {
 
                     let t_zone = t_zone_vec.get(pc.zi).copied().unwrap_or(21.0);
 
-                    // Per-surface MRT: view-factor weighted or area-weighted fallback
-                    let t_mrt =
+                    // Per-surface MRT and the factor on the radiation coefficient:
+                    // view-factor weighted (factor 1), or the reciprocal
+                    // area-weighted fallback, whose total exchange weight
+                    // Σ_j c_ij is close to but not exactly 1.
+                    let (t_mrt, k_rad) =
                         if let (Some(face_i), Some(ref zvf), Some(ref fea), Some(ref feat)) = (
                             self.surfaces[i].box_face,
                             self.zone_view_factors.get(pc.zi).and_then(|v| v.as_ref()),
@@ -3841,23 +3904,27 @@ impl EnvelopeSolver for BuildingEnvelope {
                                 den += f * fea[k];
                             }
                             if den > 1.0e-10 {
-                                num / den
+                                (num / den, 1.0)
                             } else {
-                                t_zone
+                                (t_zone, 1.0)
                             }
                         } else {
-                            // Area-weighted MRT excluding self
+                            // Reciprocal area-weighted exchange, excluding self:
+                            //   Σ_{j≠i} c_ij·T_j = ½[(ΣeT − e_i·T_i)/(S−e_i)
+                            //                        + (R_T − e_i·T_i/(S−e_i))]
+                            //   Σ_{j≠i} c_ij     = ½[1 + R − e_i/(S−e_i)]
+                            // T_mrt is their ratio, k_rad the weight sum.
                             let eps_i = self.surfaces[i].thermal_absorptance_inside;
-                            let a_i = self.surfaces[i].net_area;
-                            let ea_i = eps_i * a_i;
-                            let sum_ea_excl = zone_sum_ea[pc.zi] - ea_i;
-                            let sum_eat_excl =
-                                zone_sum_eat[pc.zi] - ea_i * self.surfaces[i].temp_inside;
-                            if sum_ea_excl > 1.0e-10 {
-                                sum_eat_excl / sum_ea_excl
-                            } else {
-                                t_zone
-                            }
+                            let ea_i = eps_i * self.surfaces[i].net_area;
+                            reciprocal_mrt(
+                                zone_sum_ea[pc.zi],
+                                zone_sum_eat[pc.zi],
+                                zone_recip[pc.zi],
+                                zone_recip_t[pc.zi],
+                                ea_i,
+                                self.surfaces[i].temp_inside,
+                            )
+                            .unwrap_or((t_zone, 1.0))
                         };
                     let t_old = t_inside_old[i];
 
@@ -3874,7 +3941,7 @@ impl EnvelopeSolver for BuildingEnvelope {
                     let eps = self.surfaces[i].thermal_absorptance_inside;
                     let t_mean_k =
                         ((self.surfaces[i].temp_inside + 273.15) + (t_mrt + 273.15)) / 2.0;
-                    let h_rad = 4.0 * eps * SIGMA * t_mean_k.powi(3);
+                    let h_rad = 4.0 * eps * SIGMA * t_mean_k.powi(3) * k_rad;
                     self.surfaces[i].h_rad_inside = h_rad;
                     self.surfaces[i].q_rad_inside = h_rad * (t_mrt - self.surfaces[i].temp_inside);
 
@@ -5016,6 +5083,39 @@ impl BuildingEnvelope {
     }
 }
 
+/// Mean radiant temperature and exchange-weight factor for one surface under
+/// the reciprocal area-weighted interior long-wave model.
+///
+/// With e_j = ε_j·A_j and S = Σ e_j over the zone, surface i exchanges with
+/// surface j through c_ij = e_j·½(1/(S−e_i) + 1/(S−e_j)). Then A_i·c_ij is
+/// symmetric in i and j, so the zone's surfaces trade long-wave radiation
+/// without creating or losing energy. The one-sided weight e_j/(S−e_i) is
+/// not symmetric and leaks heat whenever surface sizes differ.
+///
+/// Inputs are the zone sums S = Σe, Σe·T, R = Σ e/(S−e), R_T = Σ e·T/(S−e)
+/// and this surface's e_i, T_i. Returns (T_mrt, k) where k = Σ_{j≠i} c_ij
+/// multiplies the linearised radiation coefficient, or None when the zone has
+/// no other radiating surface.
+fn reciprocal_mrt(
+    sum_ea: f64,
+    sum_eat: f64,
+    recip: f64,
+    recip_t: f64,
+    ea_i: f64,
+    t_i: f64,
+) -> Option<(f64, f64)> {
+    let rest = sum_ea - ea_i;
+    if rest <= 1.0e-10 {
+        return None;
+    }
+    let num = 0.5 * ((sum_eat - ea_i * t_i) / rest + (recip_t - ea_i * t_i / rest));
+    let den = 0.5 * (1.0 + recip - ea_i / rest);
+    if den <= 1.0e-10 {
+        return None;
+    }
+    Some((num / den, den))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5023,6 +5123,46 @@ mod tests {
     use openbse_core::ports::{SimulationContext, SizingInternalGains};
     use openbse_core::types::{DayType, TimeStep};
     use openbse_psychrometrics::MoistAirState;
+
+    #[test]
+    fn test_reciprocal_mrt_conserves_energy() {
+        // Surfaces of very different size and temperature, as in a U-shaped
+        // core: the net long-wave exchange over the zone must be zero.
+        let areas = [49.2, 49.2, 70.0, 70.0, 4.0, 4.0, 62.0, 62.0];
+        let temps = [20.7, 21.3, 21.4, 22.9, 19.8, 23.5, 21.0, 22.2];
+        let eps = 0.9;
+        let e: Vec<f64> = areas.iter().map(|a| eps * a).collect();
+        let s: f64 = e.iter().sum();
+        let s_t: f64 = e.iter().zip(temps.iter()).map(|(e, t)| e * t).sum();
+        let r: f64 = e.iter().map(|e| e / (s - e)).sum();
+        let r_t: f64 = e
+            .iter()
+            .zip(temps.iter())
+            .map(|(e, t)| e * t / (s - e))
+            .sum();
+        let h = 4.6; // same linearised coefficient for every surface
+        let mut net = 0.0;
+        for ((a, &e_i), &t_i) in areas.iter().zip(&e).zip(&temps) {
+            let (mrt, k) = reciprocal_mrt(s, s_t, r, r_t, e_i, t_i).unwrap();
+            net += a * eps * h * k * (mrt - t_i);
+        }
+        assert!(net.abs() < 1e-9, "net interior long-wave exchange {net} W");
+
+        // Equal surfaces reduce to the plain mean of the others with k = 1.
+        let e4 = [10.0; 4];
+        let t4 = [20.0, 21.0, 22.0, 23.0];
+        let s4: f64 = e4.iter().sum();
+        let st4: f64 = e4.iter().zip(t4.iter()).map(|(e, t)| e * t).sum();
+        let r4: f64 = e4.iter().map(|e| e / (s4 - e)).sum();
+        let rt4: f64 = e4
+            .iter()
+            .zip(t4.iter())
+            .map(|(e, t)| e * t / (s4 - e))
+            .sum();
+        let (mrt, k) = reciprocal_mrt(s4, st4, r4, rt4, 10.0, 20.0).unwrap();
+        assert!((mrt - 22.0).abs() < 1e-12);
+        assert!((k - 1.0).abs() < 1e-12);
+    }
 
     fn make_simple_model() -> BuildingEnvelope {
         use crate::material::ConstructionLayer;
