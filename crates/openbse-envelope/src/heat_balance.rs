@@ -3024,6 +3024,8 @@ impl EnvelopeSolver for BuildingEnvelope {
             //
             // 2. Area-weighted MRT (fallback): single zone MRT from ε·A weighting.
             let mut zone_mrt_for_windows = vec![21.0_f64; self.zones.len()];
+            // (S, Σe·T, R, R_T) per zone for reciprocal_mrt.
+            let mut zone_win_recip = vec![(0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64); self.zones.len()];
 
             // Per-face ε-weighted data for VF zones (used for both windows and opaque MRT)
             let mut vf_face_ea: Vec<Option<[f64; 6]>> = vec![None; self.zones.len()];
@@ -3054,6 +3056,26 @@ impl EnvelopeSolver for BuildingEnvelope {
                 } else {
                     zone_mrt_for_windows[zi] = t_zone_vec.get(zi).copied().unwrap_or(21.0);
                 }
+
+                // Reciprocity sums so windows in non-box zones use the same
+                // reciprocal exchange as opaque surfaces (see reciprocal_mrt).
+                let mut recip = 0.0_f64;
+                let mut recip_t = 0.0_f64;
+                for &si in &zone.surface_indices {
+                    let s = &self.surfaces[si];
+                    let eps = if s.is_window {
+                        s.glass_emissivity
+                    } else {
+                        s.thermal_absorptance_inside
+                    };
+                    let e = eps * s.net_area;
+                    let rest = sum_ea - e;
+                    if rest > 1.0e-10 {
+                        recip += e / rest;
+                        recip_t += e * s.temp_inside / rest;
+                    }
+                }
+                zone_win_recip[zi] = (sum_ea, sum_eat, recip, recip_t);
 
                 // For VF zones: compute per-face ε·(A/A_face) sums.
                 // Include ALL surfaces (opaque + windows) so that the VF-weighted
@@ -3092,9 +3114,10 @@ impl EnvelopeSolver for BuildingEnvelope {
                         .unwrap_or(0);
                     let t_z = t_zone_vec.get(zi).copied().unwrap_or(21.0);
 
-                    // Per-window MRT: use view-factor weighting if available,
-                    // otherwise fall back to area-weighted zone MRT.
-                    let t_mrt =
+                    // Per-window MRT and radiation-coefficient factor: view-factor
+                    // weighting if available, otherwise the reciprocal
+                    // area-weighted exchange (same as opaque surfaces).
+                    let (t_mrt, k_rad_win) =
                         if let (Some(face_i), Some(ref zvf), Some(ref fea), Some(ref feat)) = (
                             self.surfaces[i].box_face,
                             self.zone_view_factors.get(zi).and_then(|v| v.as_ref()),
@@ -3115,12 +3138,17 @@ impl EnvelopeSolver for BuildingEnvelope {
                                 den += f * fea[k];
                             }
                             if den > 1.0e-10 {
-                                num / den
+                                (num / den, 1.0)
                             } else {
-                                t_z
+                                (t_z, 1.0)
                             }
                         } else {
-                            zone_mrt_for_windows.get(zi).copied().unwrap_or(t_z)
+                            let (s, s_t, r, r_t) = zone_win_recip[zi];
+                            let ea_w = self.surfaces[i].glass_emissivity * self.surfaces[i].net_area;
+                            reciprocal_mrt(s, s_t, r, r_t, ea_w, self.surfaces[i].temp_inside)
+                                .unwrap_or_else(|| {
+                                    (zone_mrt_for_windows.get(zi).copied().unwrap_or(t_z), 1.0)
+                                })
                         };
 
                     // Dynamic exterior combined coefficient: h_conv (already computed
@@ -3265,7 +3293,7 @@ impl EnvelopeSolver for BuildingEnvelope {
                         // (previously used T_zone, which over-estimated radiation to glass
                         // since T_zone > T_mrt by 4-5°C during heating)
                         let t_mean_in_k = ((t_glass + t_mrt) / 2.0 + 273.15).max(200.0);
-                        h_rad_in = 4.0 * eps_glass * SIGMA * t_mean_in_k.powi(3);
+                        h_rad_in = 4.0 * eps_glass * SIGMA * t_mean_in_k.powi(3) * k_rad_win;
 
                         // Enforce minimum total interior film
                         if h_conv_in + h_rad_in < 2.0 {
