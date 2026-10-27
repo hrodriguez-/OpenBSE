@@ -2455,6 +2455,13 @@ impl EnvelopeSolver for BuildingEnvelope {
         // 4. Infiltration + scheduled ventilation + exhaust + outdoor air
         let w_outdoor = psych::w_fn_tdb_rh_pb(t_outdoor, weather.rel_humidity / 100.0, p_b);
         let rho_outdoor = psych::rho_air_fn_pb_tdb_w(p_b, t_outdoor, w_outdoor);
+        // Standard air density (station pressure, 20°C, dry), matching
+        // EnergyPlus StdRhoAir: E+ converts HVAC *design* volume flows —
+        // ideal-loads outdoor air among them — to mass at standard density,
+        // not at the live outdoor density. Using ρ(T_out) made cold-weather
+        // ventilation air ~10% heavier than E+'s, a heating-only bias that
+        // grew with the outdoor-air rate.
+        let rho_std = psych::rho_air_fn_pb_tdb_w(p_b, 20.0, 0.0);
 
         // If airflow network is active, solve the pressure network for infiltration.
         // This replaces the per-zone Design Flow Rate infiltration calculation.
@@ -2851,7 +2858,7 @@ impl EnvelopeSolver for BuildingEnvelope {
                         person_flow.max(area_flow).max(abs_flow).max(ach_flow)
                     }
                 };
-                zone.outdoor_air_mass_flow = oa_flow * rho_outdoor;
+                zone.outdoor_air_mass_flow = oa_flow * rho_std;
 
                 // Exhaust flow from ventilation requirements
                 // (supplements the explicit exhaust_fan flow via ASHRAE combined model)
@@ -2868,7 +2875,7 @@ impl EnvelopeSolver for BuildingEnvelope {
                 // Add exhaust requirement to exhaust mass flow (supplements fan exhaust).
                 // Take max of fan exhaust and requirement exhaust — they represent
                 // the same physical air removal, not additive sources.
-                let exhaust_req_mass_flow = exhaust_from_oa * rho_outdoor;
+                let exhaust_req_mass_flow = exhaust_from_oa * rho_std;
                 if exhaust_req_mass_flow > zone.exhaust_mass_flow {
                     zone.exhaust_mass_flow = exhaust_req_mass_flow;
                 }
