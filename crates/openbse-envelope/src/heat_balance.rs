@@ -2925,6 +2925,34 @@ impl EnvelopeSolver for BuildingEnvelope {
                 })
                 .collect();
 
+            // Σ ε·A per zone for the radiant internal gain distribution.
+            // Matching EnergyPlus (ITABSF/TMULT): radiant gains land on every
+            // surface, windows included, in proportion to ε·A. The window's
+            // share is absorbed at the glass and mostly returns to the zone
+            // through the interior film; the rest conducts out. Distributing
+            // over opaque surfaces by plain area while counting window area in
+            // the denominator (the previous model) silently dropped the window
+            // share — gains worth several kWh/m²·yr in a glazed office never
+            // entered any heat balance, and heating read high by that much.
+            let zone_gain_sum_ea: Vec<f64> = self
+                .zones
+                .iter()
+                .map(|zone| {
+                    zone.surface_indices
+                        .iter()
+                        .map(|&si| {
+                            let s = &self.surfaces[si];
+                            let eps = if s.is_window {
+                                s.glass_emissivity
+                            } else {
+                                s.thermal_absorptance_inside
+                            };
+                            eps * s.net_area
+                        })
+                        .sum()
+                })
+                .collect();
+
             for i in 0..self.surfaces.len() {
                 if self.surfaces[i].is_window {
                     let zi = self
@@ -3036,6 +3064,19 @@ impl EnvelopeSolver for BuildingEnvelope {
                     // (T_sky << T_air for vertical windows with F_sky=0.5), pulling
                     // the glass exterior colder and increasing conduction loss.
                     // Interior radiation references the zone MRT from opaque surfaces.
+                    // The window's ε·A share of the zone's radiant internal
+                    // gains, absorbed at the glass node (E+ ITABSF/TMULT).
+                    // Through the balance below, most of it re-enters the zone
+                    // via the interior film and the rest conducts out.
+                    let q_gain_abs_per_area = {
+                        let sum_ea = zone_gain_sum_ea.get(zi).copied().unwrap_or(0.0);
+                        if sum_ea > 1.0e-10 && zi < self.zones.len() {
+                            self.zones[zi].q_internal_rad * eps_glass / sum_ea
+                        } else {
+                            0.0
+                        }
+                    };
+
                     let mut h_conv_in: f64 = 3.0;
                     let mut h_rad_in: f64 = 5.0;
                     let mut t_glass: f64 = (t_ext_eff + t_z) / 2.0;
@@ -3043,7 +3084,8 @@ impl EnvelopeSolver for BuildingEnvelope {
                         t_glass = (u_e_glass * t_ext_eff
                             + h_conv_in * t_z
                             + h_rad_in * t_mrt
-                            + q_solar_abs_per_area)
+                            + q_solar_abs_per_area
+                            + q_gain_abs_per_area)
                             / (u_e_glass + h_conv_in + h_rad_in);
 
                         // Dynamic gap thermal model (ISO 15099): recompute u_glass
@@ -3174,8 +3216,10 @@ impl EnvelopeSolver for BuildingEnvelope {
                     // corrupted the dynamic gap model (which uses T_ext_surf to
                     // compute gap ΔT), inflating u_glass and making the glass
                     // ~4°C too cold during peak solar.
-                    let q_interior =
-                        h_conv_in * (t_z - t_glass) + q_rad_interior + q_solar_abs_per_area;
+                    let q_interior = h_conv_in * (t_z - t_glass)
+                        + q_rad_interior
+                        + q_solar_abs_per_area
+                        + q_gain_abs_per_area;
                     let t_ext_surf = t_glass - q_interior / u_glass;
                     self.surfaces[i].temp_outside = t_ext_surf;
 
@@ -3299,20 +3343,20 @@ impl EnvelopeSolver for BuildingEnvelope {
                         0.0
                     };
 
-                    let zone_total_area: f64 = if zi < self.zones.len() {
-                        self.zones[zi]
-                            .surface_indices
-                            .iter()
-                            .map(|&si| self.surfaces[si].net_area)
-                            .sum()
-                    } else {
-                        1.0
-                    };
-
-                    let q_rad_to_surface = if zone_total_area > 0.0 {
-                        zone_rad_gain * self.surfaces[i].net_area / zone_total_area
-                    } else {
-                        0.0
+                    // E+-style radiant gain distribution (ITABSF/TMULT):
+                    // this surface's share is ε·A / Σ ε·A over the whole zone,
+                    // windows included — their share is handled in the window
+                    // glass balance, so nothing is dropped.
+                    let q_rad_to_surface = {
+                        let sum_ea = zone_gain_sum_ea.get(zi).copied().unwrap_or(0.0);
+                        if sum_ea > 1.0e-10 {
+                            zone_rad_gain
+                                * self.surfaces[i].thermal_absorptance_inside
+                                * self.surfaces[i].net_area
+                                / sum_ea
+                        } else {
+                            0.0
+                        }
                     };
 
                     // Window LW radiation is now handled through the unified
