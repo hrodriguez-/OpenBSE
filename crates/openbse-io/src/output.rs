@@ -1428,6 +1428,10 @@ pub struct SummaryReport {
     zone_peak_cooling: HashMap<String, (f64, u32, u32, u32, f64)>,
     /// Zone floor areas for W/m² calculations
     zone_floor_areas: HashMap<String, f64>,
+    /// zone_multiplier per zone (absent = 1). Building load totals and peaks
+    /// count each multiplied zone that many times; per-zone rows stay per
+    /// single zone, as in EnergyPlus's zone tables.
+    zone_multipliers: HashMap<String, f64>,
     /// Per-submeter monthly energy [J]: (submeter, end_use) -> [12 months]
     submeter_monthly_j: HashMap<(String, String), [f64; 12]>,
 }
@@ -1470,6 +1474,7 @@ impl SummaryReport {
             zone_peak_heating: HashMap::new(),
             zone_peak_cooling: HashMap::new(),
             zone_floor_areas: HashMap::new(),
+            zone_multipliers: HashMap::new(),
             submeter_monthly_j: HashMap::new(),
         }
     }
@@ -1477,6 +1482,16 @@ impl SummaryReport {
     /// Set zone floor areas for W/m² calculations in zone loads summary.
     pub fn set_zone_areas(&mut self, areas: HashMap<String, f64>) {
         self.zone_floor_areas = areas;
+    }
+
+    /// Set zone multipliers so building load totals and peaks count every
+    /// zone a multiplied zone stands for.
+    pub fn set_zone_multipliers(&mut self, multipliers: HashMap<String, f64>) {
+        self.zone_multipliers = multipliers;
+    }
+
+    fn zone_multiplier(&self, zone: &str) -> f64 {
+        self.zone_multipliers.get(zone).copied().unwrap_or(1.0)
     }
 
     /// Set envelope area data for WWR reporting.
@@ -1495,13 +1510,22 @@ impl SummaryReport {
         self.total_timesteps += 1;
         self.dt = snapshot.dt;
 
+        // Building totals: each zone counts zone_multiplier times.
+        let total_heating: f64 = snapshot
+            .zone_heating_rate
+            .iter()
+            .map(|(z, &r)| r * self.zone_multiplier(z))
+            .sum();
+        let total_cooling: f64 = snapshot
+            .zone_cooling_rate
+            .iter()
+            .map(|(z, &r)| r * self.zone_multiplier(z))
+            .sum();
+
         let month_idx = (snapshot.month.saturating_sub(1) as usize).min(11);
         let me = &mut self.monthly[month_idx];
 
         // Accumulate energy
-        let total_heating: f64 = snapshot.zone_heating_rate.values().sum();
-        let total_cooling: f64 = snapshot.zone_cooling_rate.values().sum();
-
         me.heating_j += total_heating * snapshot.dt;
         me.cooling_j += total_cooling * snapshot.dt;
         me.hours += snapshot.dt / 3600.0;
@@ -2270,9 +2294,10 @@ impl SummaryReport {
                     display_name, area, h_w, h_wm2, h_time, c_w, c_wm2, c_time, c_oa
                 )?;
 
-                bldg_area += area;
-                bldg_pk_htg += h_w;
-                bldg_pk_clg += c_w;
+                let mult = self.zone_multiplier(zone);
+                bldg_area += area * mult;
+                bldg_pk_htg += h_w * mult;
+                bldg_pk_clg += c_w * mult;
             }
 
             writeln!(
@@ -3504,6 +3529,34 @@ mod tests {
         // Jan heating = 100W * 3600s * 10 = 3,600,000 J = 1.0 kWh
         let jan_kwh = report.monthly[0].heating_j / 3_600_000.0;
         assert!((jan_kwh - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_summary_report_applies_zone_multipliers() {
+        // A typical-floor zone with zone_multiplier 14 stands for 14 floors:
+        // building load totals and peaks must count it 14 times.
+        let mut report = SummaryReport::new(HashMap::new(), HashMap::new());
+        let mut mults = HashMap::new();
+        mults.insert("Mid".to_string(), 14.0);
+        report.set_zone_multipliers(mults);
+        let mut areas = HashMap::new();
+        areas.insert("Ground".to_string(), 100.0);
+        areas.insert("Mid".to_string(), 100.0);
+        report.set_zone_areas(areas);
+
+        let mut snap = OutputSnapshot::new(1, 1, 1, 1, 3600.0);
+        snap.zone_heating_rate.insert("Ground".to_string(), 1000.0);
+        snap.zone_heating_rate.insert("Mid".to_string(), 500.0);
+        snap.zone_cooling_rate.insert("Mid".to_string(), 200.0);
+        report.add_snapshot(&snap);
+
+        // 1000 + 14 * 500 = 8000 W for one hour = 8 kWh
+        assert!((report.monthly[0].heating_j / 3_600_000.0 - 8.0).abs() < 1e-9);
+        assert!((report.monthly[0].cooling_j / 3_600_000.0 - 2.8).abs() < 1e-9);
+        assert!((report.peak_heating.0 - 8000.0).abs() < 1e-9);
+        assert!((report.peak_cooling.0 - 2800.0).abs() < 1e-9);
+        // Per-zone peaks stay per single zone.
+        assert!((report.zone_peak_heating["Mid"].0 - 500.0).abs() < 1e-9);
     }
 
     #[test]

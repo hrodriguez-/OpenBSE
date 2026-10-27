@@ -2105,6 +2105,12 @@ fn main() -> Result<()> {
                     .map(|z| (z.input.name.clone(), z.input.floor_area))
                     .collect();
                 report.set_zone_areas(zone_areas);
+                report.set_zone_multipliers(
+                    env.zones
+                        .iter()
+                        .map(|z| (z.input.name.clone(), z.input.zone_multiplier as f64))
+                        .collect(),
+                );
             }
             Some(report)
         } else {
