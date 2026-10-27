@@ -24,6 +24,7 @@ use crate::ground_temp::GroundTempModel;
 use crate::infiltration;
 use crate::internal_gains;
 use crate::material::{Construction, Material, Roughness, SimpleConstruction, WindowConstruction};
+use crate::rad_exchange;
 use crate::schedule::{day_of_week, ScheduleManager};
 use crate::shading;
 use crate::solar;
@@ -73,10 +74,10 @@ pub struct BuildingEnvelope {
     /// Site elevation above sea level [m].
     /// Used for air mass correction in Perez sky model (matching E+).
     pub elevation: f64,
-    /// Per-zone interior view factors for radiation exchange.
-    /// `Some` for zones where vertex-based box geometry is available;
-    /// `None` for zones that fall back to area-weighted MRT.
-    pub zone_view_factors: Vec<Option<ZoneViewFactors>>,
+    /// Per-zone interior long-wave exchange: EnergyPlus-style grey
+    /// interchange (ScriptF) factors over the zone's surfaces.
+    /// `None` only for zones with fewer than two radiating surfaces.
+    pub zone_rad_exchange: Vec<Option<rad_exchange::ZoneRadExchange>>,
     /// Interzone surface pairs: `interzone_pairs[i] = Some(j)` means surface i
     /// and surface j are opposite faces of the same interzone wall.
     /// Matches EnergyPlus behaviour where `T_outside[i] = T_inside[j]` and vice versa,
@@ -314,24 +315,6 @@ impl SolarCache {
             fingerprint,
         })
     }
-}
-
-/// Interior view factor data for a zone modeled as a rectangular box.
-///
-/// Uses analytical view factor formulas for parallel and perpendicular
-/// rectangles to compute face-to-face radiation exchange factors.
-/// Per-surface view factors are derived using uniform irradiation
-/// assumption: F(surf_i → surf_j) = F(face_i → face_j) × A_j / A_face_j.
-///
-/// This replaces the area-weighted MRT approximation with proper geometric
-/// view factors, matching the physics of EnergyPlus ScriptF for box zones.
-#[derive(Debug, Clone)]
-pub struct ZoneViewFactors {
-    /// 6×6 face-to-face view factor matrix.
-    /// Indices: 0=floor, 1=ceiling, 2=south, 3=north, 4=east, 5=west.
-    pub face_vf: [[f64; 6]; 6],
-    /// Total area of each face [m²] (sum of all surfaces on that face).
-    pub face_area: [f64; 6],
 }
 
 /// Solar distribution method for interior beam solar radiation.
@@ -1050,7 +1033,7 @@ impl BuildingEnvelope {
                 centroid_height,
                 diffuse_sky_shading_ratio: 1.0, // Updated by compute_diffuse_shading_ratios()
                 diffuse_horizon_shading_ratio: 1.0, // Updated by compute_diffuse_shading_ratios()
-                box_face: None,                 // Set after zone VF computation below
+                zone_rad_pos: 0,                // Set in the zone exchange build below
                 f_factor_ground_temps: {
                     // Store F-factor ground temperatures on the surface state
                     // so the heat balance uses FCfactorMethod temps instead of
@@ -1122,97 +1105,41 @@ impl BuildingEnvelope {
 
         let n_surfaces = surface_states.len();
 
-        // ── Compute interior view factors for box-shaped zones ────────────
+        // ── Interior long-wave exchange (EnergyPlus-style ScriptF) ────────
         //
-        // For each zone, attempt to derive box dimensions (L, W, H) from the
-        // bounding box of surface vertices, classify each surface into one of
-        // 6 box faces, and compute the 6×6 face-to-face VF matrix.
-        //
-        // Zones without vertex data fall back to area-weighted MRT.
-        let mut zone_view_factors: Vec<Option<ZoneViewFactors>> = vec![None; zone_states.len()];
+        // For each zone, build grey interchange factors over all its surfaces
+        // from areas, orientations and emissivities: approximate view factors
+        // (F_ij ∝ A_j, same-facing surfaces see nothing), a reciprocity +
+        // completeness fix, then the Gebhart solve for inter-reflections.
+        // Works for any zone shape — no vertex data or box assumption needed.
+        let mut zone_rad_exchange: Vec<Option<rad_exchange::ZoneRadExchange>> =
+            vec![None; zone_states.len()];
 
         for (zi, zone) in zone_states.iter().enumerate() {
-            // Collect all vertices in this zone (opaque + window)
-            let zone_surfs: Vec<usize> = zone.surface_indices.clone();
-            let mut all_verts: Vec<geometry::Point3D> = Vec::new();
-            for &si in &zone_surfs {
-                if let Some(ref verts) = surface_states[si].input.vertices {
-                    all_verts.extend_from_slice(verts);
-                }
-            }
-            if all_verts.len() < 8 {
-                continue; // Need at least a box (8 corners)
-            }
-
-            // Bounding box → box dimensions
-            let x_min = all_verts.iter().map(|v| v.x).fold(f64::INFINITY, f64::min);
-            let x_max = all_verts
-                .iter()
-                .map(|v| v.x)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let y_min = all_verts.iter().map(|v| v.y).fold(f64::INFINITY, f64::min);
-            let y_max = all_verts
-                .iter()
-                .map(|v| v.y)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let z_min = all_verts.iter().map(|v| v.z).fold(f64::INFINITY, f64::min);
-            let z_max = all_verts
-                .iter()
-                .map(|v| v.z)
-                .fold(f64::NEG_INFINITY, f64::max);
-
-            let box_l = (x_max - x_min).max(0.1); // Length (east-west)
-            let box_w = (y_max - y_min).max(0.1); // Width (north-south)
-            let box_h = (z_max - z_min).max(0.1); // Height
-
-            // Classify each surface into a box face
-            let mut face_area = [0.0_f64; 6];
-            let mut all_classified = true;
-
-            for &si in &zone_surfs {
+            let mut areas = Vec::with_capacity(zone.surface_indices.len());
+            let mut azimuths = Vec::with_capacity(zone.surface_indices.len());
+            let mut tilts = Vec::with_capacity(zone.surface_indices.len());
+            let mut emissivities = Vec::with_capacity(zone.surface_indices.len());
+            for (pos, &si) in zone.surface_indices.iter().enumerate() {
                 let s = &surface_states[si];
-                if let Some(face) = geometry::classify_box_face(s.input.tilt, s.input.azimuth) {
-                    // Use gross area for windows, net area for opaque
-                    let area = if s.is_window {
-                        s.input.area
-                    } else {
-                        s.net_area
-                    };
-                    face_area[face] += area;
+                areas.push(s.net_area);
+                azimuths.push(s.input.azimuth);
+                tilts.push(s.input.tilt);
+                emissivities.push(if s.is_window {
+                    s.glass_emissivity
                 } else {
-                    all_classified = false;
-                    break;
-                }
+                    s.thermal_absorptance_inside
+                });
+                surface_states[si].zone_rad_pos = pos;
             }
-
-            if !all_classified {
-                log::warn!("Zone '{}': not all surfaces classified into box faces, using area-weighted MRT", zone.input.name);
-                continue;
+            zone_rad_exchange[zi] = rad_exchange::build(&areas, &azimuths, &tilts, &emissivities);
+            if zone_rad_exchange[zi].is_none() {
+                log::warn!(
+                    "Zone '{}': fewer than two radiating surfaces, no interior \
+                     long-wave exchange",
+                    zone.input.name,
+                );
             }
-
-            // Compute 6×6 VF matrix from box dimensions
-            let face_vf = geometry::compute_box_view_factors(box_l, box_w, box_h);
-
-            // Set box_face on each surface in this zone
-            for &si in &zone_surfs {
-                let s = &surface_states[si];
-                if let Some(face) = geometry::classify_box_face(s.input.tilt, s.input.azimuth) {
-                    surface_states[si].box_face = Some(face);
-                }
-            }
-
-            log::info!(
-                "Zone '{}': view factors computed for {:.1}×{:.1}×{:.1}m box \
-                 (F_floor→ceiling={:.4}, F_floor→south={:.4})",
-                zone.input.name,
-                box_l,
-                box_w,
-                box_h,
-                face_vf[geometry::FACE_FLOOR][geometry::FACE_CEILING],
-                face_vf[geometry::FACE_FLOOR][geometry::FACE_SOUTH],
-            );
-
-            zone_view_factors[zi] = Some(ZoneViewFactors { face_vf, face_area });
         }
 
         // ── Build interzone surface pairs ─────────────────────────────
@@ -1296,7 +1223,7 @@ impl BuildingEnvelope {
             shading_polygons: Vec::new(),
             terrain: convection::Terrain::default(),
             elevation,
-            zone_view_factors,
+            zone_rad_exchange,
             interzone_pairs,
             envelope_areas,
             infiltration_interaction: crate::zone_loads::InfiltrationInteraction::Basic,
@@ -2972,78 +2899,27 @@ impl EnvelopeSolver for BuildingEnvelope {
             // the cold T_glass lowering the MRT for opaque surfaces, which then
             // exchange more heat with zone air.
 
-            // Compute zone MRT from OPAQUE surface temperatures for window interior
-            // radiation. Windows are excluded because their temp_inside hasn't been
-            // computed yet. This uses temperatures from the previous iteration/timestep.
-            //
-            // Two approaches depending on whether view factors are available:
-            //
-            // 1. View-factor MRT (zones with vertex geometry): precompute per-face
-            //    ε-weighted temperature averages, then each window gets its MRT from
-            //    the VF matrix based on which face it's on. This gives the floor a
-            //    much larger influence on south windows than the ceiling (~0.32 vs
-            //    ~0.10), matching reality and improving heating accuracy.
-            //
-            // 2. Area-weighted MRT (fallback): single zone MRT from ε·A weighting.
-            let mut zone_mrt_for_windows = vec![21.0_f64; self.zones.len()];
-
-            // Per-face ε-weighted data for VF zones (used for both windows and opaque MRT)
-            let mut vf_face_ea: Vec<Option<[f64; 6]>> = vec![None; self.zones.len()];
-            let mut vf_face_eat: Vec<Option<[f64; 6]>> = vec![None; self.zones.len()];
-
-            for (zi, zone) in self.zones.iter().enumerate() {
-                let mut sum_ea = 0.0_f64;
-                let mut sum_eat = 0.0_f64;
-
-                // Always compute area-weighted totals (used as fallback and
-                // for zones without view factors).
-                // Include ALL surfaces (opaque + windows) so that MRT accounts
-                // for cold window temperatures. Windows use ε=0.84 (standard
-                // glass emissivity), matching the value used in the window solve.
-                for &si in &zone.surface_indices {
-                    let s = &self.surfaces[si];
-                    let eps = if s.is_window {
-                        s.glass_emissivity
-                    } else {
-                        s.thermal_absorptance_inside
-                    };
-                    let ea = eps * s.net_area;
-                    sum_ea += ea;
-                    sum_eat += ea * s.temp_inside;
-                }
-                if sum_ea > 0.01 {
-                    zone_mrt_for_windows[zi] = sum_eat / sum_ea;
-                } else {
-                    zone_mrt_for_windows[zi] = t_zone_vec.get(zi).copied().unwrap_or(21.0);
-                }
-
-                // For VF zones: compute per-face ε·(A/A_face) sums.
-                // Include ALL surfaces (opaque + windows) so that the VF-weighted
-                // MRT properly accounts for cold window temperatures on each face.
-                if let Some(ref zvf) = self.zone_view_factors[zi] {
-                    let mut fea = [0.0_f64; 6];
-                    let mut feat = [0.0_f64; 6];
-                    for &si in &zone.surface_indices {
-                        let s = &self.surfaces[si];
-                        let eps = if s.is_window {
-                            s.glass_emissivity
-                        } else {
-                            s.thermal_absorptance_inside
-                        };
-                        if let Some(face) = s.box_face {
-                            let face_total = zvf.face_area[face].max(0.01);
-                            let w = eps * s.net_area / face_total;
-                            fea[face] += w;
-                            feat[face] += w * s.temp_inside;
-                        }
+            // Each window exchanges long-wave with the zone's other surfaces
+            // through the ScriptF network, exactly like opaque surfaces.
+            // Snapshot (T+273.15)⁴ per zone surface (previous iteration /
+            // timestep temperatures — the window's own temp_inside hasn't
+            // been recomputed yet, matching how E+ uses lagged temperatures
+            // in the interior exchange).
+            let zone_t4_for_windows: Vec<Vec<f64>> = self
+                .zones
+                .iter()
+                .enumerate()
+                .map(|(zi, zone)| {
+                    if self.zone_rad_exchange[zi].is_none() {
+                        return Vec::new();
                     }
-                    vf_face_ea[zi] = Some(fea);
-                    vf_face_eat[zi] = Some(feat);
-                }
-            }
-
-            // Window LW radiation is now handled through the unified face-averaged
-            // MRT (windows included in fea/feat), so no separate redistribution needed.
+                    zone
+                        .surface_indices
+                        .iter()
+                        .map(|&si| (self.surfaces[si].temp_inside + 273.15).powi(4))
+                        .collect()
+                })
+                .collect();
 
             for i in 0..self.surfaces.len() {
                 if self.surfaces[i].is_window {
@@ -3054,34 +2930,22 @@ impl EnvelopeSolver for BuildingEnvelope {
                         .unwrap_or(0);
                     let t_z = t_zone_vec.get(zi).copied().unwrap_or(21.0);
 
-                    // Per-window MRT: use view-factor weighting if available,
-                    // otherwise fall back to area-weighted zone MRT.
-                    let t_mrt = if let (Some(face_i), Some(zvf), Some(fea), Some(feat)) = (
-                        self.surfaces[i].box_face,
-                        self.zone_view_factors.get(zi).and_then(|v| v.as_ref()),
-                        vf_face_ea.get(zi).and_then(|v| v.as_ref()),
-                        vf_face_eat.get(zi).and_then(|v| v.as_ref()),
-                    ) {
-                        // VF-weighted MRT for this window:
-                        // T_mrt = Σ_{k≠face_i} F(face_i→k)·feat[k]
-                        //       / Σ_{k≠face_i} F(face_i→k)·fea[k]
-                        let mut num = 0.0_f64;
-                        let mut den = 0.0_f64;
-                        for k in 0..6 {
-                            if k == face_i {
-                                continue;
+                    // The window's radiant environment from the ScriptF row:
+                    // T_mrt⁴ = Σ_j 𝔉_ij·T_j⁴ / w_i, with w_i = Σ_j 𝔉_ij the
+                    // window's total interchange weight.
+                    let (t_mrt, w_rad_win) = match self
+                        .zone_rad_exchange
+                        .get(zi)
+                        .and_then(|v| v.as_ref())
+                    {
+                        Some(zx) => {
+                            let pos = self.surfaces[i].zone_rad_pos;
+                            match zx.radiant_temp(pos, &zone_t4_for_windows[zi]) {
+                                Some(t) => (t, zx.w[pos]),
+                                None => (t_z, 0.0),
                             }
-                            let f = zvf.face_vf[face_i][k];
-                            num += f * feat[k];
-                            den += f * fea[k];
                         }
-                        if den > 1.0e-10 {
-                            num / den
-                        } else {
-                            t_z
-                        }
-                    } else {
-                        zone_mrt_for_windows.get(zi).copied().unwrap_or(t_z)
+                        None => (t_z, 0.0),
                     };
 
                     // Dynamic exterior combined coefficient: h_conv (already computed
@@ -3222,11 +3086,10 @@ impl EnvelopeSolver for BuildingEnvelope {
                         h_conv_in =
                             convection::window_interior_convection(t_glass, t_z, win_h, win_w);
 
-                        // Interior radiation: linearized between glass and zone MRT
-                        // (previously used T_zone, which over-estimated radiation to glass
-                        // since T_zone > T_mrt by 4-5°C during heating)
-                        let t_mean_in_k = ((t_glass + t_mrt) / 2.0 + 273.15).max(200.0);
-                        h_rad_in = 4.0 * eps_glass * SIGMA * t_mean_in_k.powi(3);
+                        // Interior radiation: secant-linearized ScriptF exchange
+                        // between glass and its radiant environment, so
+                        // h_rad_in·(T_mrt − T_glass) = σ·w·(T_mrt⁴ − T_glass⁴).
+                        h_rad_in = rad_exchange::lw_coeff(w_rad_win, t_glass, t_mrt);
 
                         // Enforce minimum total interior film
                         if h_conv_in + h_rad_in < 2.0 {
@@ -3242,23 +3105,12 @@ impl EnvelopeSolver for BuildingEnvelope {
 
                     // Interior heat flow decomposition:
                     //
-                    // In EnergyPlus, window interior convection enters the zone air
-                    // balance through sum_ha/sum_hat (h_conv_inside, temp_inside =
-                    // T_glass), and LW radiation is handled by the ScriptF network.
-                    //
-                    // Since we use simplified area-weighted MRT instead of ScriptF,
-                    // routing radiation purely through MRT depression of opaque
-                    // surfaces doesn't capture enough of the window radiative loss
-                    // (area-weighted MRT dampens the effect relative to proper view
-                    // factors). Instead:
-                    //
-                    //   Convective: h_conv_in → sum_ha/sum_hat (T_glass)
-                    //   Radiative:  h_rad_in·(T_mrt − T_glass) → q_conv_inside
-                    //               → q_window_cond (direct zone air injection)
-                    //
-                    // To prevent double-counting, windows are EXCLUDED from the
-                    // per-surface MRT used by opaque surfaces (see zone_sum_ea/eat
-                    // below). This way the radiative path is counted exactly once.
+                    // As in EnergyPlus, window interior convection enters the zone
+                    // air balance through sum_ha/sum_hat (h_conv_inside, temp_inside
+                    // = T_glass), and LW radiation goes through the ScriptF network:
+                    // opaque surfaces see the cold glass directly in their own
+                    // interchange rows, so the radiative path is counted exactly
+                    // once there.
 
                     self.surfaces[i].temp_inside = t_glass;
 
@@ -3292,11 +3144,10 @@ impl EnvelopeSolver for BuildingEnvelope {
 
                     // Window interior LW radiation.
                     //
-                    // Windows now participate in the unified face-averaged MRT
-                    // (included in fea/feat). Opaque surfaces naturally see cold
-                    // window temperatures through VF-weighted MRT, and windows
-                    // see warm opaque temperatures — matching E+'s ScriptF
-                    // radiation exchange network.
+                    // Windows are rows of the zone's ScriptF matrix like every
+                    // other surface: opaque surfaces see the cold glass through
+                    // their own interchange rows, and the glass sees the warm
+                    // opaque temperatures here.
                     //
                     // The window's q_conv_inside remains zero — the convective
                     // component enters via sum_ha/sum_hat (h_conv_inside, T_glass).
@@ -3481,50 +3332,6 @@ impl EnvelopeSolver for BuildingEnvelope {
                     }));
                 } else {
                     precomp.push(None);
-                }
-            }
-
-            // ── Precompute VF face data once before inner iteration ────────
-            //
-            // For VF zones, compute per-face ε-weighted temperature averages
-            // ONCE using surface temps at the start of the inner iteration.
-            // These remain fixed during the inner loop for numerical stability,
-            // matching how EnergyPlus fixes ScriptF exchange coefficients per
-            // timestep.
-            //
-            // ALL surfaces (opaque + windows) participate, matching E+'s ScriptF
-            // where every surface exchanges radiation with every other surface.
-            // Windows use ε=0.84 (standard glass emissivity).
-            //
-            // fea[face] = Σ_{j on face} ε_j × A_j / A_face
-            // feat[face] = Σ_{j on face} ε_j × A_j / A_face × T_j
-            //
-            // The area-weighted fallback (zone_sum_ea/eat) is still recomputed
-            // each inner iteration because its broader averaging provides
-            // sufficient self-damping.
-            let mut opaque_face_ea: Vec<Option<[f64; 6]>> = vec![None; self.zones.len()];
-            let mut opaque_face_eat: Vec<Option<[f64; 6]>> = vec![None; self.zones.len()];
-
-            for (zi, zone) in self.zones.iter().enumerate() {
-                if let Some(ref zvf) = self.zone_view_factors[zi] {
-                    let mut fea = [0.0_f64; 6];
-                    let mut feat = [0.0_f64; 6];
-                    for &si in &zone.surface_indices {
-                        let s = &self.surfaces[si];
-                        let eps = if s.is_window {
-                            s.glass_emissivity
-                        } else {
-                            s.thermal_absorptance_inside
-                        };
-                        if let Some(face) = s.box_face {
-                            let face_total = zvf.face_area[face].max(0.01);
-                            let w = eps * s.net_area / face_total;
-                            fea[face] += w;
-                            feat[face] += w * s.temp_inside;
-                        }
-                    }
-                    opaque_face_ea[zi] = Some(fea);
-                    opaque_face_eat[zi] = Some(feat);
                 }
             }
 
@@ -3789,22 +3596,25 @@ impl EnvelopeSolver for BuildingEnvelope {
                 // Save old temps for convergence check and damping
                 let t_inside_old: Vec<f64> = self.surfaces.iter().map(|s| s.temp_inside).collect();
 
-                // Area-weighted totals (recomputed each iteration for self-exclusion)
-                let mut zone_sum_ea: Vec<f64> = vec![0.0; self.zones.len()];
-                let mut zone_sum_eat: Vec<f64> = vec![0.0; self.zones.len()];
-                for (zi, zone) in self.zones.iter().enumerate() {
-                    for &si in &zone.surface_indices {
-                        let s = &self.surfaces[si];
-                        let eps = if s.is_window {
-                            s.glass_emissivity
-                        } else {
-                            s.thermal_absorptance_inside
-                        };
-                        let a = s.net_area;
-                        zone_sum_ea[zi] += eps * a;
-                        zone_sum_eat[zi] += eps * a * s.temp_inside;
-                    }
-                }
+                // (T+273.15)⁴ per zone surface for the ScriptF exchange,
+                // snapshotted at the start of this iteration. Windows keep the
+                // glass temperature from the window solve above, so opaque
+                // surfaces see cold glass through their interchange rows.
+                let zone_t4: Vec<Vec<f64>> = self
+                    .zones
+                    .iter()
+                    .enumerate()
+                    .map(|(zi, zone)| {
+                        if self.zone_rad_exchange[zi].is_none() {
+                            return Vec::new();
+                        }
+                        zone
+                            .surface_indices
+                            .iter()
+                            .map(|&si| (self.surfaces[si].temp_inside + 273.15).powi(4))
+                            .collect()
+                    })
+                    .collect();
 
                 // Solve each surface
                 for i in 0..self.surfaces.len() {
@@ -3815,43 +3625,24 @@ impl EnvelopeSolver for BuildingEnvelope {
 
                     let t_zone = t_zone_vec.get(pc.zi).copied().unwrap_or(21.0);
 
-                    // Per-surface MRT: view-factor weighted or area-weighted fallback
-                    let t_mrt = if let (Some(face_i), Some(zvf), Some(fea), Some(feat)) = (
-                        self.surfaces[i].box_face,
-                        self.zone_view_factors.get(pc.zi).and_then(|v| v.as_ref()),
-                        opaque_face_ea.get(pc.zi).and_then(|v| v.as_ref()),
-                        opaque_face_eat.get(pc.zi).and_then(|v| v.as_ref()),
-                    ) {
-                        // VF-weighted MRT: only faces ≠ face_i contribute
-                        // (surfaces on the same face have F=0, so self is excluded)
-                        let mut num = 0.0_f64;
-                        let mut den = 0.0_f64;
-                        for k in 0..6 {
-                            if k == face_i {
-                                continue;
+                    // Radiant environment from the surface's ScriptF row:
+                    // T_mrt⁴ = Σ_j 𝔉_ij·T_j⁴ / w_i. With the secant-linearized
+                    // coefficient below, h_rad·(T_mrt − T_i) equals the exact
+                    // net interchange σ·Σ_j 𝔉_ij·(T_j⁴ − T_i⁴), and reciprocity
+                    // of A·𝔉 makes the zone's exchange sum to zero.
+                    let (t_mrt, w_rad) = match self
+                        .zone_rad_exchange
+                        .get(pc.zi)
+                        .and_then(|v| v.as_ref())
+                    {
+                        Some(zx) => {
+                            let pos = self.surfaces[i].zone_rad_pos;
+                            match zx.radiant_temp(pos, &zone_t4[pc.zi]) {
+                                Some(t) => (t, zx.w[pos]),
+                                None => (t_zone, 0.0),
                             }
-                            let f = zvf.face_vf[face_i][k];
-                            num += f * feat[k];
-                            den += f * fea[k];
                         }
-                        if den > 1.0e-10 {
-                            num / den
-                        } else {
-                            t_zone
-                        }
-                    } else {
-                        // Area-weighted MRT excluding self
-                        let eps_i = self.surfaces[i].thermal_absorptance_inside;
-                        let a_i = self.surfaces[i].net_area;
-                        let ea_i = eps_i * a_i;
-                        let sum_ea_excl = zone_sum_ea[pc.zi] - ea_i;
-                        let sum_eat_excl =
-                            zone_sum_eat[pc.zi] - ea_i * self.surfaces[i].temp_inside;
-                        if sum_ea_excl > 1.0e-10 {
-                            sum_eat_excl / sum_ea_excl
-                        } else {
-                            t_zone
-                        }
+                        None => (t_zone, 0.0),
                     };
                     let t_old = t_inside_old[i];
 
@@ -3864,11 +3655,10 @@ impl EnvelopeSolver for BuildingEnvelope {
                     .max(0.1);
                     self.surfaces[i].h_conv_inside = h_conv;
 
-                    // Linearized interior LW radiation coefficient
-                    let eps = self.surfaces[i].thermal_absorptance_inside;
-                    let t_mean_k =
-                        ((self.surfaces[i].temp_inside + 273.15) + (t_mrt + 273.15)) / 2.0;
-                    let h_rad = 4.0 * eps * SIGMA * t_mean_k.powi(3);
+                    // Secant-linearized interior LW radiation coefficient:
+                    // exact against the T⁴ interchange at this iterate.
+                    let h_rad =
+                        rad_exchange::lw_coeff(w_rad, self.surfaces[i].temp_inside, t_mrt);
                     self.surfaces[i].h_rad_inside = h_rad;
                     self.surfaces[i].q_rad_inside = h_rad * (t_mrt - self.surfaces[i].temp_inside);
 

@@ -19,6 +19,7 @@ pub mod heat_balance;
 pub mod infiltration;
 pub mod internal_gains;
 pub mod material;
+pub mod rad_exchange;
 pub mod schedule;
 pub mod shading;
 pub mod solar;
