@@ -171,6 +171,12 @@ pub struct ShadingPolygon {
     pub vertices: Vec<Point3D>,
     pub normal: Vec3,
     pub solar_transmittance: f64,
+    /// A window-attached shading device (overhang or fin), as opposed to
+    /// building self-shading geometry, context buildings or explicit shades.
+    /// Devices sit close to the glass and bounce part of the blocked diffuse
+    /// back in, so their diffuse-sky blocking is capped; large-scale
+    /// obstruction is not.
+    pub is_device: bool,
 }
 
 /// A 2D point in the local coordinate system of a surface.
@@ -1034,6 +1040,7 @@ pub fn resolve_shading_surfaces(inputs: &[ShadingSurfaceInput]) -> Vec<ShadingPo
                 vertices: ss.vertices.clone(),
                 normal,
                 solar_transmittance: ss.solar_transmittance,
+                is_device: false,
             })
         })
         .collect()
@@ -1052,6 +1059,7 @@ pub fn surface_to_shading_polygon(name: &str, vertices: &[Point3D]) -> Option<Sh
         vertices: vertices.to_vec(),
         normal,
         solar_transmittance: 0.0,
+        is_device: false,
     })
 }
 
@@ -1264,6 +1272,7 @@ mod tests {
             vertices: overhang_verts,
             normal: Vec3::new(0.0, 0.0, -1.0), // faces down
             solar_transmittance: 0.0,
+            is_device: true,
         };
 
         // Sun at 45° from due south → shadow drops 1m down the wall

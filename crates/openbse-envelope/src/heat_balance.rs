@@ -1726,10 +1726,11 @@ impl BuildingEnvelope {
                             if let Some(ref ovh) = shade_input.overhang {
                                 let ovh_verts =
                                     shading::generate_overhang_vertices(verts, ovh, &wall_outward);
-                                if let Some(sp) = shading::surface_to_shading_polygon(
+                                if let Some(mut sp) = shading::surface_to_shading_polygon(
                                     &format!("ovh:{}", surf.name),
                                     &ovh_verts,
                                 ) {
+                                    sp.is_device = true;
                                     polygons.push(sp);
                                 }
                             }
@@ -1742,10 +1743,11 @@ impl BuildingEnvelope {
                                     &wall_outward,
                                     shading::FinSide::Left,
                                 );
-                                if let Some(sp) = shading::surface_to_shading_polygon(
+                                if let Some(mut sp) = shading::surface_to_shading_polygon(
                                     &format!("lfin:{}", surf.name),
                                     &fin_verts,
                                 ) {
+                                    sp.is_device = true;
                                     polygons.push(sp);
                                 }
                             }
@@ -1758,10 +1760,11 @@ impl BuildingEnvelope {
                                     &wall_outward,
                                     shading::FinSide::Right,
                                 );
-                                if let Some(sp) = shading::surface_to_shading_polygon(
+                                if let Some(mut sp) = shading::surface_to_shading_polygon(
                                     &format!("rfin:{}", surf.name),
                                     &fin_verts,
                                 ) {
+                                    sp.is_device = true;
                                     polygons.push(sp);
                                 }
                             }
@@ -2074,10 +2077,39 @@ impl BuildingEnvelope {
                         .filter(|sp| sp.name != *self_name)
                         .collect();
 
-                    let ratio =
-                        shading::compute_diffuse_sky_shading_ratio(verts, &normal, &casters);
-                    let horiz_ratio =
-                        shading::compute_diffuse_horizon_shading_ratio(verts, &normal, &casters);
+                    let (ratio, horiz_ratio) = if self.surfaces[si].is_window {
+                        // Windows: large-scale obstruction (building wings,
+                        // context, explicit shades) blocks the sky dome and
+                        // the horizon band at full strength, exactly like
+                        // E+ DifShdgRatioIsoSky/Horiz — a courtyard window
+                        // behind a U-shape wing saw 2-4x too much diffuse
+                        // when this was capped. Only window-attached DEVICES
+                        // (overhang/fins) keep the 25% cap: they sit close to
+                        // the glass and bounce part of the blocked diffuse
+                        // back in through inter-reflections we don't model,
+                        // and they don't block the low horizon band.
+                        let bld: Vec<&shading::ShadingPolygon> =
+                            casters.iter().copied().filter(|sp| !sp.is_device).collect();
+                        let dev: Vec<&shading::ShadingPolygon> =
+                            casters.iter().copied().filter(|sp| sp.is_device).collect();
+                        let bld_sky =
+                            shading::compute_diffuse_sky_shading_ratio(verts, &normal, &bld);
+                        let bld_horiz =
+                            shading::compute_diffuse_horizon_shading_ratio(verts, &normal, &bld);
+                        let dev_sky = if dev.is_empty() {
+                            1.0
+                        } else {
+                            shading::compute_diffuse_sky_shading_ratio(verts, &normal, &dev)
+                        };
+                        (bld_sky * dev_sky.max(0.75), bld_horiz)
+                    } else {
+                        (
+                            shading::compute_diffuse_sky_shading_ratio(verts, &normal, &casters),
+                            shading::compute_diffuse_horizon_shading_ratio(
+                                verts, &normal, &casters,
+                            ),
+                        )
+                    };
 
                     if ratio < 0.999 || horiz_ratio < 0.999 {
                         log::info!(
@@ -2971,25 +3003,17 @@ impl EnvelopeSolver for BuildingEnvelope {
                 //   - Horizon: passes through unshaded (overhangs block upper sky,
                 //     not low-altitude horizon band)
                 //
-                // The geometric sky_ratio is floored at 0.75 (max 25% blocking) because
-                // our model does not account for inter-reflections between shading
-                // surfaces. For complex configurations (overhang + fins), reflected
-                // diffuse radiation bouncing between shading devices and the wall
-                // recovers a portion of the blocked sky radiation. The 25% cap is a
-                // conservative limit that prevents over-shading E/W facades while
-                // correctly applying moderate diffuse shading to south overhangs.
-                let (sky_ratio, horiz_ratio) = if surface.is_window {
-                    // Windows: 25% cap to account for inter-reflections not modeled
-                    (surface.diffuse_sky_shading_ratio.max(0.75), 1.0)
-                } else {
-                    // Opaque surfaces: apply full DifShdgRatio from building
-                    // self-shading (e.g., attached garage, perpendicular walls),
-                    // matching E+ FullExterior behavior.
-                    (
-                        surface.diffuse_sky_shading_ratio,
-                        surface.diffuse_horizon_shading_ratio,
-                    )
-                };
+                // Window-attached devices (overhang/fins) have their diffuse
+                // blocking capped at 25% inside compute_diffuse_shading_ratios
+                // (inter-reflections off the device recover part of it);
+                // building self-shading, context and explicit shades apply at
+                // full strength there for windows and opaque alike, matching
+                // E+ DifShdgRatioIsoSky/Horiz. So the stored ratios are used
+                // directly for every surface.
+                let (sky_ratio, horiz_ratio) = (
+                    surface.diffuse_sky_shading_ratio,
+                    surface.diffuse_horizon_shading_ratio,
+                );
                 let shaded_sky_diffuse = components.sky_diffuse * sky_ratio
                     + components.circumsolar * sunlit
                     + components.horizon * horiz_ratio;
