@@ -6776,6 +6776,21 @@ fn simulate_all_loops(
                         let term_inlet = AirPort::new(supply.state, term_inlet_flow);
                         if let GraphComponent::Air(component) = graph.component_mut(node_idx) {
                             let term_outlet = component.simulate_air(&term_inlet, ctx);
+                            if zone_temp_init > cool_sp + 1.0 {
+                                log::debug!(
+                                    "vav-box hot {} {}/{} {}:{}: sig={:.2} inlet={:.3} \
+                                     out_flow={:.3} out_t={:.1}",
+                                    zone_name,
+                                    ctx.timestep.month,
+                                    ctx.timestep.day,
+                                    ctx.timestep.hour,
+                                    ctx.timestep.sub_hour,
+                                    control_signal,
+                                    term_inlet_flow,
+                                    term_outlet.mass_flow,
+                                    term_outlet.state.t_db
+                                );
+                            }
 
                             // Record terminal outputs
                             let mut term_outputs = HashMap::new();
