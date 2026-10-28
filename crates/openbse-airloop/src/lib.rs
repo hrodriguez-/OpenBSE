@@ -1368,18 +1368,22 @@ pub fn build_vav_signals(
                     // the warm solve), so pure load-following equilibrates
                     // above setpoint at near-minimum flow. A real VAV damper
                     // (and E+'s in-timestep terminal control) drives on the
-                    // zone error instead: full stroke 0.5 K above setpoint, a
-                    // typical thermostat throttling range. The error reads the
-                    // START-of-timestep temperature, held through the HVAC
-                    // iteration like the heating ramp (#170) — read from the
-                    // converging temperature it chased its own cooling and the
-                    // damper flipped min/max between iterations.
+                    // zone error instead: a 0.5 K throttling range CENTERED on
+                    // the setpoint (open from 0.25 K below, full stroke 0.25 K
+                    // above), approximating the PI control that holds a real
+                    // zone AT setpoint — a band starting at the setpoint left
+                    // a sawtooth parked just above the 0.2 K comfort
+                    // tolerance. The error reads the START-of-timestep
+                    // temperature, held through the HVAC iteration like the
+                    // heating ramp (#170) — read from the converging
+                    // temperature it chased its own cooling and the damper
+                    // flipped min/max between iterations.
                     let start_temp = ctx
                         .zone_start_temps
                         .get(zone_name)
                         .copied()
                         .unwrap_or(zone_temp);
-                    let error = (start_temp - cool_sp).clamp(0.0, 0.5);
+                    let error = (start_temp - (cool_sp - 0.25)).clamp(0.0, 0.5);
                     let m_error = min_flow + (design_flow - min_flow) * (error / 0.5);
                     if cool_load > 100.0 {
                         // m = Q / (Cp × (T_zone - SAT))
