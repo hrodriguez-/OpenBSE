@@ -4314,6 +4314,20 @@ fn main() -> Result<()> {
                     }
                     let afn_active = env.airflow_network.is_some();
 
+                    // Zones whose serving air loop is scheduled OFF this hour
+                    // are defended at the thermostat's unoccupied setback/setup
+                    // setpoints (by the night-cycle), so unmet hours below are
+                    // counted against those, not the occupied values.
+                    let mut zone_hvac_off: HashSet<String> = HashSet::new();
+                    for li in loop_infos.iter() {
+                        if let Some(ref sched_name) = li.availability_schedule {
+                            let avail = env.schedule_manager.fraction(sched_name, hour, dow);
+                            if avail < 0.5 {
+                                zone_hvac_off.extend(li.served_zones.iter().cloned());
+                            }
+                        }
+                    }
+
                     for zone in &env.zones {
                         let name = zone.input.name.clone();
                         snapshot.zone_temperature.insert(name.clone(), zone.temp);
@@ -4392,9 +4406,42 @@ fn main() -> Result<()> {
                         let is_conditioned = zone.input.conditioned;
 
                         if has_setpoints && is_conditioned {
-                            let (heat_sp, cool_sp) = zone
+                            // Count unmet hours against the setpoint the live
+                            // thermostat defends this hour: the zone's explicit
+                            // schedule when it has one, otherwise the
+                            // controller's occupied values — or its unoccupied
+                            // setback/setup values while the zone's air loop is
+                            // scheduled off.
+                            let fallback = zone
                                 .input
                                 .active_setpoints(hour, ctx.timestep.day_of_year());
+                            let has_schedule = !zone.input.thermostat_schedule.is_empty();
+                            let (heat_sp, cool_sp) = if has_schedule {
+                                fallback
+                            } else {
+                                let occ_h = zone_heating_setpoints
+                                    .get(&name)
+                                    .copied()
+                                    .unwrap_or(fallback.0);
+                                let occ_c = zone_cooling_setpoints
+                                    .get(&name)
+                                    .copied()
+                                    .unwrap_or(fallback.1);
+                                if zone_hvac_off.contains(&name) {
+                                    (
+                                        zone_unocc_heating_setpoints
+                                            .get(&name)
+                                            .copied()
+                                            .unwrap_or(occ_h),
+                                        zone_unocc_cooling_setpoints
+                                            .get(&name)
+                                            .copied()
+                                            .unwrap_or(occ_c),
+                                    )
+                                } else {
+                                    (occ_h, occ_c)
+                                }
+                            };
                             snapshot.zone_heating_setpoint.insert(name.clone(), heat_sp);
                             snapshot.zone_cooling_setpoint.insert(name.clone(), cool_sp);
 
@@ -5632,43 +5679,60 @@ fn simulate_all_loops(
         // Without this, sub-hourly timesteps cause destructive ON/OFF
         // oscillation where the system repeatedly heats thermal mass then
         // lets it drain, wasting enormous energy.
-        let is_unoccupied = false;
+        let mut is_unoccupied = false;
         let nightcycle_duty = 1.0_f64; // 1.0 = full operation during occupied
-        let _cycling_run_time = 1800.0_f64; // E+ default: 1800 seconds (30 min)
-        let _nightcycle_tolerance = 1.0_f64; // degrees C
+        let cycling_run_time = 1800.0_f64; // E+ default: 1800 seconds (30 min)
+        let nightcycle_tolerance = 1.0_f64; // degrees C
 
-        if let Some(ref sched_name) = li.availability_schedule {
-            if let Some(mgr) = schedule_mgr {
-                let avail = mgr.fraction(sched_name, hour, day_of_week);
-                if avail < 0.5 {
-                    // System scheduled OFF — no night-cycle (matches E+
-                    // simplified model without AvailabilityManager:NightCycle).
-                    //
-                    // Night-cycle availability management is tracked as a
-                    // future feature in the README.
-                    nightcycle_timers.insert(li.name.clone(), 0.0);
-                    for comp_name in &li.component_names {
-                        let mut comp_outputs = HashMap::new();
-                        comp_outputs.insert("outlet_temperature".to_string(), t_outdoor);
-                        comp_outputs.insert("outlet_temp".to_string(), t_outdoor);
-                        comp_outputs.insert("outlet_humidity_ratio".to_string(), ctx.outdoor_air.w);
-                        comp_outputs.insert("outlet_w".to_string(), ctx.outdoor_air.w);
-                        comp_outputs.insert("mass_flow".to_string(), 0.0);
-                        comp_outputs.insert("outlet_enthalpy".to_string(), ctx.outdoor_air.h);
-                        comp_outputs.insert("inlet_temperature".to_string(), t_outdoor);
-                        comp_outputs.insert("inlet_humidity_ratio".to_string(), ctx.outdoor_air.w);
-                        comp_outputs.insert("inlet_enthalpy".to_string(), ctx.outdoor_air.h);
-                        comp_outputs.insert("electric_power".to_string(), 0.0);
-                        comp_outputs.insert("fuel_power".to_string(), 0.0);
-                        comp_outputs.insert("thermal_output".to_string(), 0.0);
-                        all_outputs.insert(comp_name.clone(), comp_outputs);
-                    }
-                    continue; // Skip this loop entirely
-                } else {
-                    // System is occupied/ON — clear any night-cycle timer
-                    nightcycle_timers.insert(li.name.clone(), 0.0);
+        let scheduled_off = match (&li.availability_schedule, schedule_mgr) {
+            (Some(sched_name), Some(mgr)) => mgr.fraction(sched_name, hour, day_of_week) < 0.5,
+            _ => false,
+        };
+        if scheduled_off {
+            // System scheduled OFF — night-cycle check (CycleOnAny): the loop
+            // cycles ON when any served zone is more than the thermostat
+            // tolerance beyond its unoccupied setpoint, and once triggered
+            // stays ON for the cycling run time. While cycled on it pursues
+            // the unoccupied setpoints with the outdoor-air damper closed
+            // (is_unoccupied below).
+            let triggered = li.served_zones.iter().any(|z| {
+                let t = match zone_temps.get(z) {
+                    Some(t) => *t,
+                    None => return false,
+                };
+                let heat_sp = zone_unocc_heat_sp.get(z).or_else(|| zone_heat_sp.get(z)).copied();
+                let cool_sp = zone_unocc_cool_sp.get(z).or_else(|| zone_cool_sp.get(z)).copied();
+                heat_sp.is_some_and(|sp| t < sp - nightcycle_tolerance)
+                    || cool_sp.is_some_and(|sp| t > sp + nightcycle_tolerance)
+            });
+            let timer = nightcycle_timers.get(&li.name).copied().unwrap_or(0.0);
+            if triggered || timer > 0.0 {
+                is_unoccupied = true;
+                let run_time = if triggered { cycling_run_time } else { timer };
+                nightcycle_timers.insert(li.name.clone(), (run_time - _dt).max(0.0));
+            } else {
+                nightcycle_timers.insert(li.name.clone(), 0.0);
+                for comp_name in &li.component_names {
+                    let mut comp_outputs = HashMap::new();
+                    comp_outputs.insert("outlet_temperature".to_string(), t_outdoor);
+                    comp_outputs.insert("outlet_temp".to_string(), t_outdoor);
+                    comp_outputs.insert("outlet_humidity_ratio".to_string(), ctx.outdoor_air.w);
+                    comp_outputs.insert("outlet_w".to_string(), ctx.outdoor_air.w);
+                    comp_outputs.insert("mass_flow".to_string(), 0.0);
+                    comp_outputs.insert("outlet_enthalpy".to_string(), ctx.outdoor_air.h);
+                    comp_outputs.insert("inlet_temperature".to_string(), t_outdoor);
+                    comp_outputs.insert("inlet_humidity_ratio".to_string(), ctx.outdoor_air.w);
+                    comp_outputs.insert("inlet_enthalpy".to_string(), ctx.outdoor_air.h);
+                    comp_outputs.insert("electric_power".to_string(), 0.0);
+                    comp_outputs.insert("fuel_power".to_string(), 0.0);
+                    comp_outputs.insert("thermal_output".to_string(), 0.0);
+                    all_outputs.insert(comp_name.clone(), comp_outputs);
                 }
+                continue; // Skip this loop entirely
             }
+        } else {
+            // System is occupied/ON — clear any night-cycle timer
+            nightcycle_timers.insert(li.name.clone(), 0.0);
         }
 
         // ── Minimum OA schedule (E+ MinOA_MotorizedDamper_Sched) ──────────
