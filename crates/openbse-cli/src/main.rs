@@ -5717,8 +5717,11 @@ fn simulate_all_loops(
         // lets it drain, wasting enormous energy.
         let mut is_unoccupied = false;
         let nightcycle_duty = 1.0_f64; // 1.0 = full operation during occupied
-        let cycling_run_time = 1800.0_f64; // E+ default: 1800 seconds (30 min)
-        let nightcycle_tolerance = 1.0_f64; // degrees C
+        // E+ HVACTemplate generates AvailabilityManager:NightCycle with a
+        // 0.2 K thermostat tolerance and a 3600 s fixed run time; the looser
+        // 1 K band let zones ride 1 K below the setback all night.
+        let cycling_run_time = 3600.0_f64;
+        let nightcycle_tolerance = 0.2_f64; // degrees C
 
         let scheduled_off = match (&li.availability_schedule, schedule_mgr) {
             (Some(sched_name), Some(mgr)) => mgr.fraction(sched_name, hour, day_of_week) < 0.5,
