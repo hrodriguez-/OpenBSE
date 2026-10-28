@@ -3243,6 +3243,35 @@ fn main() -> Result<()> {
                         let zone_cooling_setpoints = scheduled_cool_sp
                             .as_ref()
                             .unwrap_or(&zone_cooling_setpoints);
+                        // Zones whose air loop is scheduled OFF this hour are
+                        // defended at the thermostat's unoccupied setback/setup
+                        // values (night-cycle). The zone loads that drive
+                        // terminal reheat and the envelope's ideal loads must
+                        // target those, not the occupied setpoints — otherwise
+                        // every night-cycle burst heats toward the occupied
+                        // value and overshoots the setback.
+                        let mut active_heating_setpoints = zone_heating_setpoints.clone();
+                        let mut active_cooling_setpoints = (*zone_cooling_setpoints).clone();
+                        for li in loop_infos.iter() {
+                            let off = li
+                                .availability_schedule
+                                .as_ref()
+                                .map(|s| env.schedule_manager.fraction(s, hour, dow) < 0.5)
+                                .unwrap_or(false);
+                            if !off {
+                                continue;
+                            }
+                            for z in &li.served_zones {
+                                if let Some(&sp) = zone_unocc_heating_setpoints.get(z) {
+                                    active_heating_setpoints.insert(z.clone(), sp);
+                                }
+                                if let Some(&sp) = zone_unocc_cooling_setpoints.get(z) {
+                                    active_cooling_setpoints.insert(z.clone(), sp);
+                                }
+                            }
+                        }
+                        let active_heating_setpoints = &active_heating_setpoints;
+                        let active_cooling_setpoints = &active_cooling_setpoints;
                         // Radiant panels meet the zone's load to setpoint (#167):
                         // the predictor's load to start, then the load still
                         // unmet after each envelope solve. Controlled on the
@@ -3259,8 +3288,8 @@ fn main() -> Result<()> {
                                 &radiant_panels,
                                 &env.zones,
                                 &zone_start_air_temps,
-                                &zone_heating_setpoints,
-                                zone_cooling_setpoints,
+                                active_heating_setpoints,
+                                active_cooling_setpoints,
                                 |rp| rp.convective_output,
                             ),
                         );
@@ -3271,8 +3300,8 @@ fn main() -> Result<()> {
                                 &vrf_systems,
                                 &env.zones,
                                 &zone_start_air_temps,
-                                &zone_heating_setpoints,
-                                zone_cooling_setpoints,
+                                active_heating_setpoints,
+                                active_cooling_setpoints,
                             )
                             .into_iter()
                             .map(|(zone, (mode, _))| (zone, mode))
@@ -3300,8 +3329,8 @@ fn main() -> Result<()> {
                                     &ctx,
                                     &mut loop_infos,
                                     &current_zone_temps,
-                                    &zone_heating_setpoints,
-                                    zone_cooling_setpoints,
+                                    active_heating_setpoints,
+                                    active_cooling_setpoints,
                                     &zone_unocc_heating_setpoints,
                                     &zone_unocc_cooling_setpoints,
                                     &zone_heat_sp_schedule,
@@ -3824,8 +3853,8 @@ fn main() -> Result<()> {
                                     &vrf_systems,
                                     &env.zones,
                                     &zone_start_air_temps,
-                                    &zone_heating_setpoints,
-                                    zone_cooling_setpoints,
+                                    active_heating_setpoints,
+                                    active_cooling_setpoints,
                                 )
                                 .into_iter()
                                 .map(|(zone, (_, load))| {
@@ -3891,8 +3920,8 @@ fn main() -> Result<()> {
                                 }
                             }
                             // Pass setpoints so envelope can compute ideal loads at setpoint
-                            hvac_conds.cooling_setpoints = zone_cooling_setpoints.clone();
-                            hvac_conds.heating_setpoints = zone_heating_setpoints.clone();
+                            hvac_conds.cooling_setpoints = active_cooling_setpoints.clone();
+                            hvac_conds.heating_setpoints = active_heating_setpoints.clone();
 
                             // ── Radiant Panel Gains ───────────────────────────────
                             // The radiant share goes to the zone surfaces, the
@@ -4007,8 +4036,8 @@ fn main() -> Result<()> {
                                         &radiant_panels,
                                         &env.zones,
                                         &zone_start_air_temps,
-                                        &zone_heating_setpoints,
-                                        zone_cooling_setpoints,
+                                        active_heating_setpoints,
+                                        active_cooling_setpoints,
                                         |rp| rp.thermal_output_to_zone,
                                     ),
                                 );
@@ -4072,12 +4101,12 @@ fn main() -> Result<()> {
                                     let name = &z.input.name;
                                     let t_start =
                                         zone_start_air_temps.get(name).copied().unwrap_or(z.temp);
-                                    let to_heat = zone_heating_setpoints
+                                    let to_heat = active_heating_setpoints
                                         .get(name)
                                         .map_or(z.load_to_heating_setpoint, |&sp| {
                                             z.ideal_load_line.at(sp, t_start)
                                         });
-                                    let cooling = zone_cooling_setpoints
+                                    let cooling = active_cooling_setpoints
                                         .get(name)
                                         .map_or(z.ideal_cooling_load, |&sp| {
                                             (-z.ideal_load_line.at(sp, t_start)).max(0.0)
