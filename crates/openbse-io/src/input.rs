@@ -4620,7 +4620,7 @@ pub fn compute_oa_fraction(
                 let area_flow = oa.per_area * floor_area;
                 let abs_flow = oa.absolute;
                 let ach_flow = oa.ach * volume / 3600.0;
-                total_oa_flow += match oa.oa_method {
+                let per_instance = match oa.oa_method {
                     openbse_envelope::zone_loads::OaMethod::Sum => {
                         person_flow + area_flow + abs_flow + ach_flow
                     }
@@ -4628,6 +4628,7 @@ pub fn compute_oa_fraction(
                         person_flow.max(area_flow).max(abs_flow).max(ach_flow)
                     }
                 };
+                total_oa_flow += per_instance * zone.zone_multiplier as f64;
             }
         } else if let Some(zi) = zone_input {
             // Zone not in envelope — use raw model input
@@ -4649,7 +4650,7 @@ pub fn compute_oa_fraction(
                 let area_flow = oa.per_area * floor_area;
                 let abs_flow = oa.absolute;
                 let ach_flow = oa.ach * volume / 3600.0;
-                total_oa_flow += match oa.oa_method {
+                let per_instance = match oa.oa_method {
                     openbse_envelope::zone_loads::OaMethod::Sum => {
                         person_flow + area_flow + abs_flow + ach_flow
                     }
@@ -4657,6 +4658,7 @@ pub fn compute_oa_fraction(
                         person_flow.max(area_flow).max(abs_flow).max(ach_flow)
                     }
                 };
+                total_oa_flow += per_instance * zi.zone_multiplier as f64;
             }
         }
     }

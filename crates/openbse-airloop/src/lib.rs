@@ -1459,7 +1459,9 @@ pub fn build_vav_signals(
         };
 
         signals.zone_air_flows.insert(zone_name.clone(), zone_flow);
-        total_flow += zone_flow;
+        // The zone (and its box) is one instance; the AHU carries them all.
+        let zmult = ctx.zone_multipliers.get(zone_name).copied().unwrap_or(1) as f64;
+        total_flow += zone_flow * zmult;
     }
     total_flow = total_flow.max(0.05);
 
@@ -1472,7 +1474,10 @@ pub fn build_vav_signals(
     let design_total_flow: f64 = li
         .served_zones
         .iter()
-        .map(|z| zone_design_flows.get(z).copied().unwrap_or(0.0))
+        .map(|z| {
+            zone_design_flows.get(z).copied().unwrap_or(0.0)
+                * ctx.zone_multipliers.get(z).copied().unwrap_or(1) as f64
+        })
         .sum();
     let flow_frac = if design_total_flow > 1.0e-6 {
         (total_flow / design_total_flow).clamp(0.0, 1.0)
@@ -1515,7 +1520,8 @@ pub fn build_vav_signals(
             // Zone OA with distribution effectiveness: Voz = Vbz / Ez
             // Ez = 1.0 for well-mixed ceiling supply (ASHRAE 62.1 Table 6-2)
             let voz = vbz;
-            vou += voz;
+            // Every instance of a multiplied zone needs its own outdoor air.
+            vou += voz * ctx.zone_multipliers.get(&oa.zone_name).copied().unwrap_or(1) as f64;
 
             // Zone discharge OA fraction: Zd = Voz / Vdz
             // Vdz = actual zone airflow [m³/s]
@@ -1882,7 +1888,8 @@ pub fn build_dual_duct_signals(li: &mut LoopInfo, ctx: &SignalCtx) -> ControlSig
             .zone_supply_temps
             .insert(zone_name.clone(), supply_temp);
         signals.zone_air_flows.insert(zone_name.clone(), zone_flow);
-        total_flow += zone_flow;
+        let zmult = ctx.zone_multipliers.get(zone_name).copied().unwrap_or(1) as f64;
+        total_flow += zone_flow * zmult;
     }
     total_flow = total_flow.max(0.05);
 

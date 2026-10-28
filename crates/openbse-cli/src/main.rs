@@ -225,13 +225,16 @@ fn multizone_design_flow(
     zone_sum: openbse_io::input::ZoneSum,
     zone_design_flows: &HashMap<String, f64>,
     zone_sizing: &openbse_io::sizing::ZoneSizingResult,
+    zone_multipliers: &HashMap<String, u32>,
     cooling_sizing_factor: f64,
     heating_sizing_factor: f64,
 ) -> f64 {
+    // Zone flows are per instance; the loop carries every instance.
+    let mult = |z: &String| zone_multipliers.get(z).copied().unwrap_or(1) as f64;
     match zone_sum {
         openbse_io::input::ZoneSum::NonCoincident => served_zones
             .iter()
-            .map(|z| zone_design_flows.get(z).copied().unwrap_or(0.1))
+            .map(|z| zone_design_flows.get(z).copied().unwrap_or(0.1) * mult(z))
             .sum(),
         openbse_io::input::ZoneSum::Coincident => {
             let cooling = zone_sizing
@@ -241,7 +244,7 @@ fn multizone_design_flow(
                 .map(|hour| {
                     served_zones
                         .iter()
-                        .map(|z| hour.get(z).copied().unwrap_or(0.0))
+                        .map(|z| hour.get(z).copied().unwrap_or(0.0) * mult(z))
                         .sum::<f64>()
                 })
                 .fold(0.0, f64::max);
@@ -253,6 +256,7 @@ fn multizone_design_flow(
                         .get(z)
                         .copied()
                         .unwrap_or(0.0)
+                        * mult(z)
                 })
                 .sum();
             (cooling * cooling_sizing_factor).max(heating * heating_sizing_factor)
@@ -1010,6 +1014,26 @@ fn main() -> Result<()> {
             .unwrap_or_default();
         let mut comp_zone_multiplier: HashMap<String, f64> = HashMap::new();
         for li in &loop_infos {
+            // Multi-zone central systems (VAV, dual duct, DOAS) are sized and
+            // simulated on the multiplied sum of their zones' flows, so their
+            // own components carry no multiplier; each terminal box serves
+            // one instance of its zone and is scaled by that zone's own
+            // multiplier. Single-zone units (PSZ, FCU, PTAC, PTHP, CRAC) are
+            // one unit per instance: every component scales by the zone's
+            // multiplier (the loop's largest, for the odd mixed loop).
+            let central = matches!(
+                li.system_type,
+                AirLoopSystemType::Vav | AirLoopSystemType::DualDuct | AirLoopSystemType::Doas
+            );
+            if central {
+                for (zone, term_name) in &li.terminal_boxes {
+                    let zm = zone_multipliers.get(zone).copied().unwrap_or(1) as f64;
+                    if zm > 1.0 {
+                        comp_zone_multiplier.insert(term_name.clone(), zm);
+                    }
+                }
+                continue;
+            }
             let mult: f64 = li
                 .served_zones
                 .iter()
@@ -1758,10 +1782,16 @@ fn main() -> Result<()> {
                                 zone_sum,
                                 &zone_design_flows,
                                 &sizing_result.zone_sizing,
+                                &zone_multipliers,
                                 model.simulation.cooling_sizing_factor,
                                 model.simulation.heating_sizing_factor,
                             );
                             let zone_flow_m3 = zone_airflow / air_density;
+                            // Zone peaks are per instance; the central coils
+                            // serve every instance of each zone.
+                            let zmult = |z: &String| {
+                                zone_multipliers.get(z).copied().unwrap_or(1) as f64
+                            };
                             let zone_heat: f64 = li
                                 .served_zones
                                 .iter()
@@ -1771,6 +1801,7 @@ fn main() -> Result<()> {
                                         .get(z)
                                         .copied()
                                         .unwrap_or(0.0)
+                                        * zmult(z)
                                 })
                                 .sum::<f64>()
                                 * model.simulation.heating_sizing_factor;
@@ -1783,6 +1814,7 @@ fn main() -> Result<()> {
                                         .get(z)
                                         .copied()
                                         .unwrap_or(0.0)
+                                        * zmult(z)
                                 })
                                 .sum::<f64>()
                                 * model.simulation.cooling_sizing_factor;
@@ -1805,6 +1837,7 @@ fn main() -> Result<()> {
                                         .get(z)
                                         .copied()
                                         .unwrap_or(0.1)
+                                        * zone_multipliers.get(z).copied().unwrap_or(1) as f64
                                 })
                                 .sum();
                             let oa_flow_kg = zone_airflow * 0.30;
@@ -2227,8 +2260,9 @@ fn main() -> Result<()> {
                                             _ => None,
                                         })
                                         .sum();
-                                    total_oa_flow += oa.per_person * people_count
-                                        + oa.per_area * zone.input.floor_area;
+                                    total_oa_flow += (oa.per_person * people_count
+                                        + oa.per_area * zone.input.floor_area)
+                                        * zone.input.zone_multiplier as f64;
                                 }
                             }
                         }
@@ -6629,9 +6663,9 @@ fn simulate_all_loops(
                         10000.0
                     };
 
-                    // Zone cooling load from the heat balance (multiplied for zone_multiplier)
-                    let zone_cool_load = zone_cooling_loads.get(zone_name).copied().unwrap_or(0.0)
-                        * zone_multipliers.get(zone_name).copied().unwrap_or(1) as f64;
+                    // Zone cooling load from the heat balance, per instance: the
+                    // terminal box serves one copy of the zone.
+                    let zone_cool_load = zone_cooling_loads.get(zone_name).copied().unwrap_or(0.0);
 
                     // Get VAV box max flow for load-based signal
                     let vav_max_flow = zone_design_flows
@@ -7328,12 +7362,39 @@ mod tests {
             ..Default::default()
         };
         let design = flows(9.2, 2.3); // each zone's peak × 1.15
-        let non_coincident =
-            multizone_design_flow(&zones, ZoneSum::NonCoincident, &design, &sizing, 1.15, 1.25);
+        let no_mult: HashMap<String, u32> = HashMap::new();
+        let non_coincident = multizone_design_flow(
+            &zones,
+            ZoneSum::NonCoincident,
+            &design,
+            &sizing,
+            &no_mult,
+            1.15,
+            1.25,
+        );
         assert!((non_coincident - 11.5).abs() < 1e-12);
-        let coincident =
-            multizone_design_flow(&zones, ZoneSum::Coincident, &design, &sizing, 1.15, 1.25);
+        let coincident = multizone_design_flow(
+            &zones,
+            ZoneSum::Coincident,
+            &design,
+            &sizing,
+            &no_mult,
+            1.15,
+            1.25,
+        );
         assert!((coincident - 9.0 * 1.15).abs() < 1e-12);
+        // A multiplied zone counts once per instance in the loop's sum.
+        let south_x3: HashMap<String, u32> = [("South".to_string(), 3)].into_iter().collect();
+        let multiplied = multizone_design_flow(
+            &zones,
+            ZoneSum::NonCoincident,
+            &design,
+            &sizing,
+            &south_x3,
+            1.15,
+            1.25,
+        );
+        assert!((multiplied - (9.2 + 3.0 * 2.3)).abs() < 1e-12);
         // Heating flows set the floor when they are larger.
         let heating_led = openbse_io::sizing::ZoneSizingResult {
             zone_heating_airflow: flows(10.0, 0.0),
@@ -7344,6 +7405,7 @@ mod tests {
             ZoneSum::Coincident,
             &design,
             &heating_led,
+            &no_mult,
             1.15,
             1.25,
         );
