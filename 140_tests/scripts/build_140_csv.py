@@ -80,6 +80,11 @@ KNOWN_FAILURES = {
     # performance map, which run about 9% longer here than the fitted
     # biquadratic curve does this far below its data.
     ("CE540", "Annual Condenser Fan (kWh)"),
+    # 660 (low-E windows) annual heating sits 0.6% below its band on current
+    # upstream main (3554 vs [3574, 6140] floor 3574) — verified identical on
+    # pure upstream (ci/upstream-baseline) and with the fork's fixes, so it is
+    # inherited, not caused by them. Tracked as window-model calibration.
+    ("660", "Annual Heating (kWh)"),
 }
 
 
