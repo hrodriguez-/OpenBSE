@@ -4318,10 +4318,16 @@ fn main() -> Result<()> {
                     // are defended at the thermostat's unoccupied setback/setup
                     // setpoints (by the night-cycle), so unmet hours below are
                     // counted against those, not the occupied values.
+                    let mut snapshot_dow =
+                        openbse_envelope::schedule::day_of_week(month, day, env.jan1_dow);
+                    if env.holiday_set.contains(&(month, day)) {
+                        snapshot_dow = 8;
+                    }
                     let mut zone_hvac_off: HashSet<String> = HashSet::new();
                     for li in loop_infos.iter() {
                         if let Some(ref sched_name) = li.availability_schedule {
-                            let avail = env.schedule_manager.fraction(sched_name, hour, dow);
+                            let avail =
+                                env.schedule_manager.fraction(sched_name, hour, snapshot_dow);
                             if avail < 0.5 {
                                 zone_hvac_off.extend(li.served_zones.iter().cloned());
                             }
@@ -5700,8 +5706,14 @@ fn simulate_all_loops(
                     Some(t) => *t,
                     None => return false,
                 };
-                let heat_sp = zone_unocc_heat_sp.get(z).or_else(|| zone_heat_sp.get(z)).copied();
-                let cool_sp = zone_unocc_cool_sp.get(z).or_else(|| zone_cool_sp.get(z)).copied();
+                let heat_sp = zone_unocc_heat_sp
+                    .get(z)
+                    .or_else(|| zone_heat_sp.get(z))
+                    .copied();
+                let cool_sp = zone_unocc_cool_sp
+                    .get(z)
+                    .or_else(|| zone_cool_sp.get(z))
+                    .copied();
                 heat_sp.is_some_and(|sp| t < sp - nightcycle_tolerance)
                     || cool_sp.is_some_and(|sp| t > sp + nightcycle_tolerance)
             });
