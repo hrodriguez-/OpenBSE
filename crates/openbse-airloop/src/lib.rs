@@ -1294,6 +1294,27 @@ pub fn build_vav_signals(
             sat_setpoint = sat_setpoint.min(sat_needed);
         }
     }
+    // Error feedback, as for the terminal dampers: the per-timestep load
+    // estimate under-predicts for zones already above setpoint, so the
+    // Warmest reset floats the deck too warm to pull them back. A zone more
+    // than 0.25 K above its cooling setpoint (start-of-timestep temperature,
+    // held through the HVAC iteration) drags the deck toward the minimum
+    // SAT, reaching it 1 K above setpoint.
+    let mut max_cool_err = 0.0_f64;
+    for zone_name in &li.served_zones {
+        let start_temp = ctx
+            .zone_start_temps
+            .get(zone_name)
+            .copied()
+            .or_else(|| zone_temps.get(zone_name).copied())
+            .unwrap_or(21.0);
+        let cool_sp = zone_cool_sp.get(zone_name).copied().unwrap_or(23.9);
+        max_cool_err = max_cool_err.max(start_temp - cool_sp);
+    }
+    if max_cool_err > 0.25 {
+        let frac = ((max_cool_err - 0.25) / 0.75).clamp(0.0, 1.0);
+        sat_setpoint = sat_setpoint.min(sat_max - frac * (sat_max - sat_min));
+    }
     // Clamp to E+ SetpointManager range — unless the coil is held at a fixed
     // scheduled SAT (ASHRAE 140 §11 AE300/AE400 terminal-reheat systems), where
     // the central cooling coil always targets `cooling_supply_temp` and the
