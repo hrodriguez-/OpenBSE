@@ -1274,7 +1274,10 @@ pub fn build_vav_signals(
     let cp = 1005.0_f64;
     let v_heat_max_frac = 0.50;
     let sat_min = li.cooling_supply_temp; // E+ SetpointManager:Warmest MinimumTemperature
-    let sat_max = 15.6_f64; // E+ SetpointManager:Warmest MaximumTemperature
+    // E+ SetpointManager:Warmest default Maximum Setpoint Temperature (and
+    // what HVACTemplate generates) is 18 C; the earlier 15.6 C ceiling kept
+    // the deck colder than the reference, trading fan energy for reheat.
+    let sat_max = 18.0_f64;
 
     let mut sat_setpoint = sat_max; // start warm, only drop if a zone needs it
 
