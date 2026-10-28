@@ -6707,6 +6707,23 @@ fn simulate_all_loops(
                         }
                     };
 
+                    if zone_temp_init > cool_sp + 1.0 {
+                        log::debug!(
+                            "vav-term hot {}: T0={:.1} coolSP={:.1} mode={:?} Q={:.0}W \
+                             desired={:.3} min={:.3} max={:.3} sig={:.2} SAT={:.1}",
+                            zone_name,
+                            zone_temp_init,
+                            cool_sp,
+                            mode,
+                            zone_cool_load,
+                            desired_zone_flow,
+                            min_flow,
+                            vav_max_flow,
+                            control_signal,
+                            supply_temp
+                        );
+                    }
+
                     if let Some(node_idx) = graph.node_by_name(term_name) {
                         // Set control signal on the terminal box
                         if let GraphComponent::Air(component) = graph.component_mut(node_idx) {

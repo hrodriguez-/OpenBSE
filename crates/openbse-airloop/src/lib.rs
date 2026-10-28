@@ -1370,8 +1370,32 @@ pub fn build_vav_signals(
                         let frac = ((flow - min_flow) / (design_flow - min_flow).max(0.001))
                             .clamp(0.0, 1.0);
                         max_cooling_demand = max_cooling_demand.max(frac);
+                        if zone_temp > cool_sp + 1.0 {
+                            log::debug!(
+                                "vav-signal hot {}: T={:.1} coolSP={:.1} Q={:.0}W SAT={:.1} \
+                                 m_needed={:.3} flow={:.3} min={:.3} design={:.3}",
+                                zone_name,
+                                zone_temp,
+                                cool_sp,
+                                cool_load,
+                                sat_setpoint,
+                                m_needed,
+                                flow,
+                                min_flow,
+                                design_flow
+                            );
+                        }
                         flow
                     } else {
+                        if zone_temp > cool_sp + 1.0 {
+                            log::debug!(
+                                "vav-signal hot {}: T={:.1} coolSP={:.1} Q={:.0}W <=100W → min flow",
+                                zone_name,
+                                zone_temp,
+                                cool_sp,
+                                cool_load
+                            );
+                        }
                         // Dehumidification-only: run at minimum flow to activate DX coil
                         design_flow * li.min_vav_fraction
                     }
