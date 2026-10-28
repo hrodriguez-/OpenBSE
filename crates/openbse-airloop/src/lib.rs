@@ -1366,11 +1366,14 @@ pub fn build_vav_signals(
                     // per-timestep load line under-predicts for a zone already
                     // above setpoint (its surface temperatures are frozen at
                     // the warm solve), so pure load-following equilibrates
-                    // 1-3 K high at near-minimum flow. A real VAV damper (and
-                    // E+'s in-timestep terminal control) drives on the zone
-                    // error instead: full stroke 2 K above setpoint.
-                    let error = (zone_temp - cool_sp).clamp(0.0, 2.0);
-                    let m_error = min_flow + (design_flow - min_flow) * (error / 2.0);
+                    // above setpoint at near-minimum flow. A real VAV damper
+                    // (and E+'s in-timestep terminal control) drives on the
+                    // zone error instead: full stroke 0.5 K above setpoint, a
+                    // typical thermostat throttling range. Wider bands leave a
+                    // proportional droop that parks zones just above the
+                    // 0.2 K unmet-hours tolerance.
+                    let error = (zone_temp - cool_sp).clamp(0.0, 0.5);
+                    let m_error = min_flow + (design_flow - min_flow) * (error / 0.5);
                     if cool_load > 100.0 {
                         // m = Q / (Cp × (T_zone - SAT))
                         let dt = (zone_temp - sat_setpoint).max(1.0);
