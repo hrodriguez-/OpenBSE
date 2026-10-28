@@ -5332,8 +5332,8 @@ impl EnvelopeSolver for BuildingEnvelope {
                             convection::window_interior_convection(
                                 s.temp_inside,
                                 t_air,
-                                s.height.unwrap_or(side),
-                                s.width.unwrap_or(side),
+                                s.input.height.unwrap_or(side),
+                                s.input.width.unwrap_or(side),
                             )
                         } else {
                             convection::interior_convection(s.temp_inside, t_air, s.input.tilt)
