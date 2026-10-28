@@ -5305,47 +5305,78 @@ impl EnvelopeSolver for BuildingEnvelope {
                 let cool_sp = hvac.cooling_setpoints.get(&zone.input.name).copied();
                 let heat_sp = hvac.heating_setpoints.get(&zone.input.name).copied();
 
-                zone.ideal_cooling_load = if let Some(sp) = cool_sp {
-                    let q = crate::zone::compute_ideal_q_hvac(
-                        sum_ha,
-                        sum_hat,
+                // Film coefficients at the TARGET air temperature. The solve's
+                // sum_ha/sum_hat carry h evaluated at this iteration's zone
+                // temperature; TARP h grows with |T_s - T_air|^(1/3), so at
+                // equilibrium (dT ~ 0) they under-state the convective
+                // exchange a pull-down to a setpoint several K away actually
+                // sees (about 2x at 5 K). Controls that trusted the line
+                // parked zones 1-3 K above the cooling setpoint.
+                let surf_idx: Vec<usize> = zone.surface_indices.clone();
+                let z_temp = zone.temp;
+                let z_volume = zone.input.volume;
+                let sums_at = |t_target: f64| -> (f64, f64) {
+                    let mut ha = 0.0_f64;
+                    let mut hat = 0.0_f64;
+                    for &si in &surf_idx {
+                        let s = &self.surfaces[si];
+                        let a = s.net_area;
+                        if s.temp_inside.is_nan() {
+                            ha += s.h_conv_inside * a;
+                            hat += s.h_conv_inside * a * z_temp;
+                            continue;
+                        }
+                        let t_air = t_target + surface_air_offset[si];
+                        let h = if s.is_window {
+                            let side = a.sqrt().max(0.1);
+                            convection::window_interior_convection(
+                                s.temp_inside,
+                                t_air,
+                                s.height.unwrap_or(side),
+                                s.width.unwrap_or(side),
+                            )
+                        } else {
+                            convection::interior_convection(s.temp_inside, t_air, s.input.tilt)
+                        }
+                        .max(0.1);
+                        ha += h * a;
+                        hat += h * a * (s.temp_inside - surface_air_offset[si]);
+                    }
+                    (ha, hat)
+                };
+                let q_to = |t_target: f64, t_start: f64| {
+                    let (ha, hat) = sums_at(t_target);
+                    crate::zone::compute_ideal_q_hvac(
+                        ha,
+                        hat,
                         mcpi,
                         t_outdoor,
                         q_conv_total,
                         rho_air,
-                        zone.input.volume,
+                        z_volume,
                         cp_air,
                         dt_eff,
-                        zone.temp,
-                        sp,
-                    );
-                    // Negative Q = cooling needed; convert to positive cooling load
-                    (-q).max(0.0)
-                } else {
-                    0.0
+                        t_start,
+                        t_target,
+                    )
                 };
 
-                zone.load_to_heating_setpoint = if let Some(sp) = heat_sp {
-                    crate::zone::compute_ideal_q_hvac(
-                        sum_ha,
-                        sum_hat,
-                        mcpi,
-                        t_outdoor,
-                        q_conv_total,
-                        rho_air,
-                        zone.input.volume,
-                        cp_air,
-                        dt_eff,
-                        zone.temp,
-                        sp,
-                    )
-                } else {
+                // Negative Q = cooling needed; store cooling as a positive load.
+                zone.ideal_cooling_load = match cool_sp {
+                    Some(sp) => (-q_to(sp, z_temp)).max(0.0),
+                    None => 0.0,
+                };
+                zone.load_to_heating_setpoint = match heat_sp {
+                    Some(sp) => q_to(sp, z_temp),
                     // No heating setpoint: nothing ever needs reheat.
-                    f64::NEG_INFINITY
+                    None => f64::NEG_INFINITY,
                 };
                 // Positive Q = heating needed
                 zone.ideal_heating_load = zone.load_to_heating_setpoint.max(0.0);
 
+                // Load line: exact at both setpoints, each with its own film
+                // coefficients, and a secant between them. Without two
+                // distinct setpoints, the linearisation of the solve state.
                 let q_at = |t_target: f64, t_start: f64| {
                     crate::zone::compute_ideal_q_hvac(
                         sum_ha,
@@ -5354,7 +5385,7 @@ impl EnvelopeSolver for BuildingEnvelope {
                         t_outdoor,
                         q_conv_total,
                         rho_air,
-                        zone.input.volume,
+                        z_volume,
                         cp_air,
                         dt_eff,
                         t_start,
@@ -5362,10 +5393,23 @@ impl EnvelopeSolver for BuildingEnvelope {
                     )
                 };
                 let offset = q_at(0.0, 0.0);
-                zone.ideal_load_line = crate::zone::IdealLoadLine {
-                    slope: q_at(1.0, 0.0) - offset,
-                    offset,
-                    capacitance: offset - q_at(0.0, 1.0),
+                let capacitance = offset - q_at(0.0, 1.0);
+                zone.ideal_load_line = match (heat_sp, cool_sp) {
+                    (Some(h), Some(c)) if c > h + 0.5 => {
+                        let qh = q_to(h, 0.0);
+                        let qc = q_to(c, 0.0);
+                        let slope = (qc - qh) / (c - h);
+                        crate::zone::IdealLoadLine {
+                            slope,
+                            offset: qh - slope * h,
+                            capacitance,
+                        }
+                    }
+                    _ => crate::zone::IdealLoadLine {
+                        slope: q_at(1.0, 0.0) - offset,
+                        offset,
+                        capacitance,
+                    },
                 };
             }
         }
