@@ -1361,12 +1361,21 @@ pub fn build_vav_signals(
             match mode {
                 HvacMode::Cooling => {
                     let cool_load = zone_cooling_loads.get(zone_name).copied().unwrap_or(0.0);
+                    let min_flow = design_flow * li.min_vav_fraction;
+                    // Error-proportional floor, mirroring the Heating arm: the
+                    // per-timestep load line under-predicts for a zone already
+                    // above setpoint (its surface temperatures are frozen at
+                    // the warm solve), so pure load-following equilibrates
+                    // 1-3 K high at near-minimum flow. A real VAV damper (and
+                    // E+'s in-timestep terminal control) drives on the zone
+                    // error instead: full stroke 2 K above setpoint.
+                    let error = (zone_temp - cool_sp).clamp(0.0, 2.0);
+                    let m_error = min_flow + (design_flow - min_flow) * (error / 2.0);
                     if cool_load > 100.0 {
                         // m = Q / (Cp × (T_zone - SAT))
                         let dt = (zone_temp - sat_setpoint).max(1.0);
                         let m_needed = cool_load / (cp * dt);
-                        let min_flow = design_flow * li.min_vav_fraction;
-                        let flow = m_needed.clamp(min_flow, design_flow);
+                        let flow = m_needed.max(m_error).clamp(min_flow, design_flow);
                         let frac = ((flow - min_flow) / (design_flow - min_flow).max(0.001))
                             .clamp(0.0, 1.0);
                         max_cooling_demand = max_cooling_demand.max(frac);
@@ -1389,15 +1398,19 @@ pub fn build_vav_signals(
                     } else {
                         if zone_temp > cool_sp + 1.0 {
                             log::debug!(
-                                "vav-signal hot {}: T={:.1} coolSP={:.1} Q={:.0}W <=100W → min flow",
+                                "vav-signal hot {}: T={:.1} coolSP={:.1} Q={:.0}W <=100W → err flow {:.3}",
                                 zone_name,
                                 zone_temp,
                                 cool_sp,
-                                cool_load
+                                cool_load,
+                                m_error
                             );
                         }
-                        // Dehumidification-only: run at minimum flow to activate DX coil
-                        design_flow * li.min_vav_fraction
+                        // No load estimate (dehumidification-only, or the line
+                        // reads zero while the zone is above setpoint): the
+                        // error term alone drives the damper; at setpoint this
+                        // is the minimum flow as before.
+                        m_error
                     }
                 }
                 HvacMode::Heating => {

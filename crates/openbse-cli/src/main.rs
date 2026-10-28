@@ -6696,7 +6696,11 @@ fn simulate_all_loops(
                         }
                     } else {
                         match mode {
-                            HvacMode::Cooling if zone_cool_load > 0.0 => {
+                            // A zone above its cooling setpoint follows the
+                            // signal builder's flow even when the load line
+                            // reads zero — the reheat branch below must never
+                            // heat a zone that is already too warm.
+                            HvacMode::Cooling => {
                                 let frac = ((desired_zone_flow - min_flow)
                                     / (vav_max_flow - min_flow).max(0.001))
                                 .clamp(0.0, 1.0);
