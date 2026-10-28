@@ -4327,7 +4327,8 @@ fn main() -> Result<()> {
                     for li in loop_infos.iter() {
                         if let Some(ref sched_name) = li.availability_schedule {
                             let avail =
-                                env.schedule_manager.fraction(sched_name, hour, snapshot_dow);
+                                env.schedule_manager
+                                    .fraction(sched_name, hour, snapshot_dow);
                             if avail < 0.5 {
                                 zone_hvac_off.extend(li.served_zones.iter().cloned());
                             }
