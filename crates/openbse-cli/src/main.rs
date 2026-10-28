@@ -1789,9 +1789,8 @@ fn main() -> Result<()> {
                             let zone_flow_m3 = zone_airflow / air_density;
                             // Zone peaks are per instance; the central coils
                             // serve every instance of each zone.
-                            let zmult = |z: &String| {
-                                zone_multipliers.get(z).copied().unwrap_or(1) as f64
-                            };
+                            let zmult =
+                                |z: &String| zone_multipliers.get(z).copied().unwrap_or(1) as f64;
                             let zone_heat: f64 = li
                                 .served_zones
                                 .iter()
@@ -5751,6 +5750,7 @@ fn simulate_all_loops(
         // lets it drain, wasting enormous energy.
         let mut is_unoccupied = false;
         let nightcycle_duty = 1.0_f64; // 1.0 = full operation during occupied
+
         // E+ HVACTemplate generates AvailabilityManager:NightCycle with a
         // 0.2 K thermostat tolerance and a 3600 s fixed run time; the looser
         // 1 K band let zones ride 1 K below the setback all night.

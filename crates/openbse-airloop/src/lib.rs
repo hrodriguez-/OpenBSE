@@ -1521,7 +1521,12 @@ pub fn build_vav_signals(
             // Ez = 1.0 for well-mixed ceiling supply (ASHRAE 62.1 Table 6-2)
             let voz = vbz;
             // Every instance of a multiplied zone needs its own outdoor air.
-            vou += voz * ctx.zone_multipliers.get(&oa.zone_name).copied().unwrap_or(1) as f64;
+            vou += voz
+                * ctx
+                    .zone_multipliers
+                    .get(&oa.zone_name)
+                    .copied()
+                    .unwrap_or(1) as f64;
 
             // Zone discharge OA fraction: Zd = Voz / Vdz
             // Vdz = actual zone airflow [m³/s]
