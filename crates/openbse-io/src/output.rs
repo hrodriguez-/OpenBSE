@@ -2561,9 +2561,17 @@ impl SummaryReport {
             writeln!(
                 w,
                 "  ASHRAE 90.1 G3.1.2.3 unmet load hours: {} ({:.0} {} 300 occupied hours)",
-                if self.occ_unmet_hours <= 300.0 { "PASS" } else { "FAIL" },
+                if self.occ_unmet_hours <= 300.0 {
+                    "PASS"
+                } else {
+                    "FAIL"
+                },
                 self.occ_unmet_hours,
-                if self.occ_unmet_hours <= 300.0 { "<=" } else { ">" }
+                if self.occ_unmet_hours <= 300.0 {
+                    "<="
+                } else {
+                    ">"
+                }
             )?;
         }
         writeln!(w)?;
@@ -4228,8 +4236,10 @@ mod tests {
             let mut s = OutputSnapshot::new(1, 1, hour, 1, 3600.0);
             s.zone_temperature.insert("A".to_string(), ta);
             s.zone_temperature.insert("B".to_string(), tb);
-            s.zone_gain_people_sensible.insert("A".to_string(), if occ_a { 80.0 } else { 0.0 });
-            s.zone_gain_people_sensible.insert("B".to_string(), if occ_b { 80.0 } else { 0.0 });
+            s.zone_gain_people_sensible
+                .insert("A".to_string(), if occ_a { 80.0 } else { 0.0 });
+            s.zone_gain_people_sensible
+                .insert("B".to_string(), if occ_b { 80.0 } else { 0.0 });
             s
         };
         report.add_snapshot(&step(1, 25.0, 25.0, true, true)); // both warm, occupied: 1 h
