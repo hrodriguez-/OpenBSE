@@ -1434,7 +1434,16 @@ pub fn build_vav_signals(
                     // and zones overheated at part flow (B094: 94% of warm
                     // occupied steps). The iteration's 50/50 supply blend
                     // keeps it from flipping (loop gain ~2.4 < 3).
-                    let error = (zone_temp - (cool_sp - 0.25)).clamp(0.0, 0.5);
+                    // Trapezoidal: half start-of-step, half converging. Fully
+                    // implicit didn't converge in 20% of steps (B094); half
+                    // the weight halves the loop gain the iteration sees.
+                    let start_temp = ctx
+                        .zone_start_temps
+                        .get(zone_name)
+                        .copied()
+                        .unwrap_or(zone_temp);
+                    let error_temp = 0.5 * (start_temp + zone_temp);
+                    let error = (error_temp - (cool_sp - 0.25)).clamp(0.0, 0.5);
                     let m_error = min_flow + (design_flow - min_flow) * (error / 0.5);
                     if cool_load > 100.0 {
                         // m = Q / (Cp × (T_zone - SAT))
