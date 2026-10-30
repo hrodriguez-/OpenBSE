@@ -6797,6 +6797,18 @@ fn simulate_all_loops(
                                 .clamp(0.0, 1.0);
                                 -frac
                             }
+                            // A deadband zone whose damper is still easing off
+                            // from cooling (the builder's rate-limited flow is
+                            // above minimum) keeps that flow. Dropping it to
+                            // minimum here undid the rate limit
+                            // (`vav_flow_relax_for_dt`): B094's core still went
+                            // 1.34 -> 0.50 kg/s in one step and overheated.
+                            HvacMode::Deadband if desired_zone_flow > min_flow * 1.001 => {
+                                let frac = ((desired_zone_flow - min_flow)
+                                    / (vav_max_flow - min_flow).max(0.001))
+                                .clamp(0.0, 1.0);
+                                -frac
+                            }
                             // Heating and deadband (E+ SimVAV): reheat whenever the
                             // load to the heating setpoint plus warming the primary
                             // air to the zone is positive. In deadband that load is
