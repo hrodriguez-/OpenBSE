@@ -211,6 +211,15 @@ pub enum HvacMode {
     Deadband,
 }
 
+/// Where the VAV cooling throttling range reaches full flow, relative to the
+/// cooling setpoint [K] (the range is 0.5 K wide, below this). It was +0.25
+/// (centered on the setpoint), which parked loaded zones at the edge of the
+/// 0.2 K unmet tolerance: with the terminal on the builder's mode, the
+/// 100-building benchmark still had a median 587 occupied unmet cooling
+/// hours (ASHRAE 90.1 allows 300). At the setpoint, zones settle 0.25 K
+/// cooler for a little more cooling energy.
+pub const VAV_COOL_BAND_TOP: f64 = 0.0;
+
 pub fn hvac_mode(zone_temp: f64, heat_sp: f64, cool_sp: f64) -> HvacMode {
     if zone_temp < heat_sp {
         HvacMode::Heating
@@ -1314,8 +1323,10 @@ pub fn build_vav_signals(
         let cool_sp = zone_cool_sp.get(zone_name).copied().unwrap_or(23.9);
         max_cool_err = max_cool_err.max(start_temp - cool_sp);
     }
-    if max_cool_err > 0.25 {
-        let frac = ((max_cool_err - 0.25) / 0.75).clamp(0.0, 1.0);
+    // Shifted 0.25 K down with the terminal band (see VAV_COOL_BAND_TOP):
+    // the deck starts dropping at the setpoint, minimum SAT 0.75 K above.
+    if max_cool_err > VAV_COOL_BAND_TOP {
+        let frac = ((max_cool_err - VAV_COOL_BAND_TOP) / 0.75).clamp(0.0, 1.0);
         sat_setpoint = sat_setpoint.min(sat_max - frac * (sat_max - sat_min));
     }
     // Clamp to E+ SetpointManager range — unless the coil is held at a fixed
@@ -1407,7 +1418,7 @@ pub fn build_vav_signals(
                         .get(zone_name)
                         .copied()
                         .unwrap_or(zone_temp);
-                    let error = (start_temp - (cool_sp - 0.25)).clamp(0.0, 0.5);
+                    let error = (start_temp - (cool_sp + VAV_COOL_BAND_TOP - 0.5)).clamp(0.0, 0.5);
                     let m_error = min_flow + (design_flow - min_flow) * (error / 0.5);
                     if cool_load > 100.0 {
                         // m = Q / (Cp × (T_zone - SAT))
