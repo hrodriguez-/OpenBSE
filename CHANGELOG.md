@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Unmet hours in the summary report.** The totals are zone-hours over every zone and every hour; the report divided them by the run's hours ("% of occupied hours") and checked them against ASHRAE 90.1's 300-hour limit. It now labels them as zone-hours with their share, and adds the 90.1 G3.1.2.3 / EnergyPlus "During Occupied" counts: occupied hours, and hours in which any occupied zone (people gains > 0) misses its heating or cooling setpoint by more than 0.2 K. The 90.1 check uses those. The CSV summary carries the same rows.
+
 ### Added
 - **`--no-timeseries`**: skip the per-timestep results CSV and don't hold per-timestep results in memory. The summary report, sizing, custom outputs and `.err` are still written. Without it an annual run keeps every component output for every timestep until the CSV write: a 15-zone VAV office peaked at 1.2 GB at 1 step/h and 4.9 GB at 4 steps/h, and the CSV write took longer than the simulation (~100 s of a 175 s run). On a 4.8 GB server that swapped the run past a 15-minute timeout. The default is unchanged (CSV written); `--timeseries` is accepted for callers that ask explicitly.
 - **Energy-conservation and sanity checks during the run** (#160). Every run now checks the hand-offs where a load can go missing while each component is correct on its own, and reports to the `.err` file. All checks are on by default, read the solution without changing it, and cost well under 1% of run time.
