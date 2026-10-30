@@ -573,6 +573,7 @@ fn build_loop_infos(
                 ),
                 vav_step_flows: HashMap::new(),
                 vav_prev_flows: HashMap::new(),
+                vav_iter_hist: HashMap::new(),
             }
         })
         .collect()
@@ -3026,6 +3027,7 @@ fn main() -> Result<()> {
         for li in loop_infos.iter_mut() {
             li.vav_step_flows.clear();
             li.vav_prev_flows.clear();
+            li.vav_iter_hist.clear();
         }
 
         for hour_idx in start_hour..end_hour {
@@ -4249,6 +4251,7 @@ fn main() -> Result<()> {
                     // loop that didn't run this step (off) starts unlimited.
                     for li in loop_infos.iter_mut() {
                         li.vav_prev_flows = std::mem::take(&mut li.vav_step_flows);
+                        li.vav_iter_hist.clear();
                     }
 
                     // ── Run-time checks (#160) ─────────────────────────────
@@ -6181,6 +6184,11 @@ fn simulate_all_loops(
         // This iteration's VAV zone flows; the last iteration's become the
         // previous-step flows the damper rate limit starts from.
         if li.system_type == AirLoopSystemType::Vav {
+            for (z, &f) in &signals.zone_air_flows {
+                let t = zone_temps.get(z).copied().unwrap_or(21.0);
+                let last = li.vav_iter_hist.get(z).map(|&(_, f1, _)| f1);
+                li.vav_iter_hist.insert(z.clone(), (last, f, t));
+            }
             li.vav_step_flows = signals.zone_air_flows.clone();
         }
         if let Some(flow) = single_zone_vav_flow {
@@ -7627,6 +7635,7 @@ mod tests {
             vav_flow_relax: 1.0,
             vav_step_flows: HashMap::new(),
             vav_prev_flows: HashMap::new(),
+            vav_iter_hist: HashMap::new(),
         }
     }
 
@@ -7672,6 +7681,7 @@ mod tests {
             vav_flow_relax: 1.0,
             vav_step_flows: HashMap::new(),
             vav_prev_flows: HashMap::new(),
+            vav_iter_hist: HashMap::new(),
         }
     }
 
@@ -8854,6 +8864,7 @@ mod tests_datacenter {
             vav_flow_relax: 1.0,
             vav_step_flows: HashMap::new(),
             vav_prev_flows: HashMap::new(),
+            vav_iter_hist: HashMap::new(),
         }
     }
 

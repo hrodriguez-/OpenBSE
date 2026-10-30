@@ -135,6 +135,10 @@ pub struct LoopInfo {
     pub vav_flow_relax: f64,
     pub vav_step_flows: HashMap<String, f64>,
     pub vav_prev_flows: HashMap<String, f64>,
+    /// Per cooling zone, this step's HVAC-iteration history: (flow two
+    /// iterations back, last flow, converging temperature it was chosen at).
+    /// Two points give the secant step toward setpoint (see build_vav_signals).
+    pub vav_iter_hist: HashMap<String, (Option<f64>, f64, f64)>,
 }
 
 /// Damper rate limit for a timestep of `dt` seconds (see `LoopInfo::vav_flow_relax`).
@@ -1495,9 +1499,32 @@ pub fn build_vav_signals(
         // the cooling error reads the converging temperature, and an
         // undamped fixed-point iteration overshot (loop gain ~2.4), leaving
         // ~20% of steps unconverged. Same fixed point, no overshoot.
-        let zone_flow = match li.vav_step_flows.get(zone_name) {
-            Some(&prev_iter) if !li.fixed_cooling_sat => 0.5 * (zone_flow + prev_iter),
-            _ => zone_flow,
+        // A cooling zone with two earlier iterations takes the secant step:
+        // the flow at which its end-of-step temperature reaches the setpoint,
+        // from the last two (flow, temperature) points. Sunny perimeter zones
+        // swing ~12 K over the damper range against a 0.5 K band (loop gain
+        // ~24), far past what blending can settle; the secant converges in a
+        // few iterations at any gain. Until two points exist, or if the slope
+        // is not cooling-like, blend with the last iteration's flow.
+        let zone_flow = if li.fixed_cooling_sat {
+            zone_flow
+        } else {
+            match li.vav_iter_hist.get(zone_name) {
+                Some(&(Some(f2), f1, t1))
+                    if mode == HvacMode::Cooling && (f1 - f2).abs() > 1e-4 =>
+                {
+                    let slope = (zone_temp - t1) / (f1 - f2);
+                    if slope < -1e-6 {
+                        let min_flow = design_flow * li.min_vav_fraction;
+                        (f1 + (cool_sp - zone_temp) / slope)
+                            .clamp(min_flow, design_flow.max(min_flow))
+                    } else {
+                        0.5 * (zone_flow + f1)
+                    }
+                }
+                Some(&(_, f1, _)) => 0.5 * (zone_flow + f1),
+                None => zone_flow,
+            }
         };
         let zone_flow = match li.vav_prev_flows.get(zone_name) {
             Some(&prev) if !li.fixed_cooling_sat && li.vav_flow_relax < 1.0 => {
@@ -2044,6 +2071,7 @@ mod tests {
             vav_flow_relax: 1.0,
             vav_step_flows: HashMap::new(),
             vav_prev_flows: HashMap::new(),
+            vav_iter_hist: HashMap::new(),
             dd_boxes: HashMap::new(),
             explicit_min_oa: false,
             heat_recovery_name: None,
