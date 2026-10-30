@@ -127,6 +127,29 @@ pub struct LoopInfo {
     /// Standard air density at the site [kg/m³] (E+ `StdRhoAir`): converts
     /// supply mass flows to the volumes the zones' outdoor-air rates are in.
     pub std_air_density: f64,
+    /// VAV damper rate limit. Each timestep a zone's airflow moves
+    /// `vav_flow_relax` of the way from the previous timestep's final flow
+    /// (`vav_prev_flows`) to the new target; 1.0 = no limit. `vav_step_flows`
+    /// holds the flows chosen in the current timestep (every HVAC iteration
+    /// overwrites them) and becomes `vav_prev_flows` once the step converges.
+    pub vav_flow_relax: f64,
+    pub vav_step_flows: HashMap<String, f64>,
+    pub vav_prev_flows: HashMap<String, f64>,
+}
+
+/// Damper rate limit for a timestep of `dt` seconds (see `LoopInfo::vav_flow_relax`).
+///
+/// The cooling damper goes from minimum to full flow over a 0.5 K band on the
+/// start-of-step zone temperature, but a full stroke moves a typical zone
+/// about 1.2 K in one 15-minute step: a loop gain of ~2.4 per step. Above 2
+/// the control can't settle and limit-cycles between minimum and full flow
+/// (benchmark B094 core zone: 0.50 / 1.66 / 1.66 kg/s, 23.5-24.8 C, zones
+/// above setpoint + 0.2 K in ~2,100 occupied hours a year). Moving 40% of the
+/// way per 15 minutes puts the loop gain just under 1, so a zone converges
+/// inside the band without overshooting. The overshoot per step grows with
+/// the step length, so the fraction scales down with `dt`.
+pub fn vav_flow_relax_for_dt(dt: f64) -> f64 {
+    (0.4 * 900.0 / dt.max(1.0)).min(1.0)
 }
 
 /// Control role of a component in a signal builder's coil dispatch.
@@ -1460,6 +1483,18 @@ pub fn build_vav_signals(
                 HvacMode::Deadband => design_flow * li.min_vav_fraction,
             }
         };
+        // Rate-limit the damper against the previous timestep (see
+        // `vav_flow_relax_for_dt`). It applies across modes: the drop from
+        // full flow to minimum when a zone dips into the deadband is half of
+        // the limit cycle. The fixed-SAT path keeps its own terminal control.
+        let zone_flow = match li.vav_prev_flows.get(zone_name) {
+            Some(&prev) if !li.fixed_cooling_sat && li.vav_flow_relax < 1.0 => {
+                let min_flow = design_flow * li.min_vav_fraction;
+                (prev + li.vav_flow_relax * (zone_flow - prev))
+                    .clamp(min_flow, design_flow.max(min_flow))
+            }
+            _ => zone_flow,
+        };
 
         signals.zone_air_flows.insert(zone_name.clone(), zone_flow);
         // The zone (and its box) is one instance; the AHU carries them all.
@@ -1994,6 +2029,9 @@ mod tests {
             terminal_min_flow: HashMap::new(),
             min_oa_flow_mass: None,
             std_air_density: 1.204,
+            vav_flow_relax: 1.0,
+            vav_step_flows: HashMap::new(),
+            vav_prev_flows: HashMap::new(),
             dd_boxes: HashMap::new(),
             explicit_min_oa: false,
             heat_recovery_name: None,
@@ -2102,6 +2140,46 @@ mod tests {
         let mut ctx = f.ctx(-10.0);
         ctx.effective_min_oa = 0.0;
         assert_eq!(build_vav_signals(&li, &ctx, false).oa_fraction, Some(0.0));
+    }
+
+    #[test]
+    fn vav_damper_moves_part_way_from_the_previous_step() {
+        // A zone that just dropped into the deadband (B094's limit cycle):
+        // without a limit the damper snaps from full flow to minimum.
+        let li0 = make_loop(AirLoopSystemType::Vav, vec!["CHW Coil".to_string()]);
+        let f = Fixture {
+            temps: one("Zone1", 23.0),
+            heat_sp: one("Zone1", 21.0),
+            cool_sp: one("Zone1", 24.0),
+            flows: one("Zone1", 1.0),
+            cool_loads: one("Zone1", 0.0),
+            heat_loads: one("Zone1", 0.0),
+            modes: [("Zone1".to_string(), HvacMode::Deadband)]
+                .into_iter()
+                .collect(),
+            empty: HashMap::new(),
+            returns: HashMap::new(),
+            mults: HashMap::new(),
+        };
+        let min_flow = 1.0 * li0.min_vav_fraction;
+        let flow = |relax: f64, prev: Option<f64>| {
+            let mut li = li0.clone();
+            li.vav_flow_relax = relax;
+            if let Some(p) = prev {
+                li.vav_prev_flows.insert("Zone1".to_string(), p);
+            }
+            build_vav_signals(&li, &f.ctx(30.0), false).zone_air_flows["Zone1"]
+        };
+        // No limit, or no history (first step, loop just started): the target.
+        assert!((flow(1.0, Some(1.0)) - min_flow).abs() < 1e-12);
+        assert!((flow(0.4, None) - min_flow).abs() < 1e-12);
+        // Limited: 40% of the way from full flow toward the minimum.
+        let expect = 1.0 + 0.4 * (min_flow - 1.0);
+        assert!((flow(0.4, Some(1.0)) - expect).abs() < 1e-12);
+        // The rate scales with the timestep: 40% per 15 min, capped at 1.
+        assert!((vav_flow_relax_for_dt(900.0) - 0.4).abs() < 1e-12);
+        assert!((vav_flow_relax_for_dt(3600.0) - 0.1).abs() < 1e-12);
+        assert_eq!(vav_flow_relax_for_dt(60.0), 1.0);
     }
 
     #[test]

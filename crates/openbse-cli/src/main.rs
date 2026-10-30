@@ -568,6 +568,11 @@ fn build_loop_infos(
                 preheat_setpoint: al.controls.preheat_setpoint,
                 min_oa_flow_mass: al.controls.minimum_oa_flow.map(|v| v * 1.229),
                 std_air_density,
+                vav_flow_relax: openbse_airloop::vav_flow_relax_for_dt(
+                    3600.0 / model.simulation.timesteps_per_hour.max(1) as f64,
+                ),
+                vav_step_flows: HashMap::new(),
+                vav_prev_flows: HashMap::new(),
             }
         })
         .collect()
@@ -3013,6 +3018,12 @@ fn main() -> Result<()> {
         // evaporator draws from the air (#61). Applied with a one-step lag, as
         // the DHW systems are simulated after the zone heat balance.
         let mut dhw_zone_gains: HashMap<String, (f64, f64)> = HashMap::new();
+        // Sizing and warm-up runs leave VAV flows behind; the run period's
+        // first step starts without a damper history.
+        for li in loop_infos.iter_mut() {
+            li.vav_step_flows.clear();
+            li.vav_prev_flows.clear();
+        }
 
         for hour_idx in start_hour..end_hour {
             let weather_hour = &weather_data.hours[hour_idx as usize];
@@ -4230,6 +4241,12 @@ fn main() -> Result<()> {
                     // Must not happen inside the HVAC iteration loop — that
                     // would corrupt the backward-difference extrapolation.
                     env.update_bdf_history();
+                    // Same for the VAV damper rate limit: the converged step's
+                    // flows are where the next step's dampers start from. A
+                    // loop that didn't run this step (off) starts unlimited.
+                    for li in loop_infos.iter_mut() {
+                        li.vav_prev_flows = std::mem::take(&mut li.vav_step_flows);
+                    }
 
                     // ── Run-time checks (#160) ─────────────────────────────
                     // Read the converged state; nothing here changes it.
@@ -6158,6 +6175,11 @@ fn simulate_all_loops(
             // ──────────────────────────────────────────────────────────────
             AirLoopSystemType::Crah => build_crah_signals(li, &sig_ctx),
         };
+        // This iteration's VAV zone flows; the last iteration's become the
+        // previous-step flows the damper rate limit starts from.
+        if li.system_type == AirLoopSystemType::Vav {
+            li.vav_step_flows = signals.zone_air_flows.clone();
+        }
         if let Some(flow) = single_zone_vav_flow {
             for f in signals.air_mass_flows.values_mut() {
                 *f = flow;
@@ -7591,6 +7613,9 @@ mod tests {
             preheat_setpoint: None,
             min_oa_flow_mass: None,
             std_air_density: 1.204,
+            vav_flow_relax: 1.0,
+            vav_step_flows: HashMap::new(),
+            vav_prev_flows: HashMap::new(),
         }
     }
 
@@ -7633,6 +7658,9 @@ mod tests {
             preheat_setpoint: None,
             min_oa_flow_mass: None,
             std_air_density: 1.204,
+            vav_flow_relax: 1.0,
+            vav_step_flows: HashMap::new(),
+            vav_prev_flows: HashMap::new(),
         }
     }
 
@@ -8812,6 +8840,9 @@ mod tests_datacenter {
             preheat_setpoint: None,
             min_oa_flow_mass: None,
             std_air_density: 1.204,
+            vav_flow_relax: 1.0,
+            vav_step_flows: HashMap::new(),
+            vav_prev_flows: HashMap::new(),
         }
     }
 

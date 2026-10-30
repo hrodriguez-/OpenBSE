@@ -1844,6 +1844,16 @@ pub struct SummaryReport {
     unmet_cooling_hours: f64,
     /// Tolerance for unmet hours [deg C]
     unmet_tolerance: f64,
+    /// Zones checked for unmet hours (the zone-hour denominator, per step).
+    unmet_zone_count: usize,
+    /// Hours with at least one occupied zone (people gains > 0).
+    occupied_hours: f64,
+    /// ASHRAE 90.1 G3.1.2.3 style: hours in which any OCCUPIED zone is
+    /// below its heating / above its cooling setpoint by more than the
+    /// tolerance, and in which either is true.
+    occ_unmet_heating_hours: f64,
+    occ_unmet_cooling_hours: f64,
+    occ_unmet_hours: f64,
     /// Zone heating setpoints (zone_name -> setpoint)
     heating_setpoints: HashMap<String, f64>,
     /// Zone cooling setpoints (zone_name -> setpoint)
@@ -1900,6 +1910,11 @@ impl SummaryReport {
             unmet_heating_hours: 0.0,
             unmet_cooling_hours: 0.0,
             unmet_tolerance: 0.2, // 0.2 deg C tolerance
+            unmet_zone_count: 0,
+            occupied_hours: 0.0,
+            occ_unmet_heating_hours: 0.0,
+            occ_unmet_cooling_hours: 0.0,
+            occ_unmet_hours: 0.0,
             heating_setpoints,
             cooling_setpoints,
             total_timesteps: 0,
@@ -2218,6 +2233,7 @@ impl SummaryReport {
         // Use per-timestep setpoints (schedule-aware) when available,
         // otherwise fall back to static setpoints from ideal_loads defaults
         let hours_fraction = snapshot.dt / 3600.0;
+        let (mut checked, mut any_occ, mut occ_cold, mut occ_warm) = (0usize, false, false, false);
         for (zone_name, &zone_temp) in &snapshot.zone_temperature {
             let heat_sp = snapshot
                 .zone_heating_setpoint
@@ -2227,18 +2243,47 @@ impl SummaryReport {
                 .zone_cooling_setpoint
                 .get(zone_name)
                 .or_else(|| self.cooling_setpoints.get(zone_name));
+            if heat_sp.is_some() || cool_sp.is_some() {
+                checked += 1;
+            }
+            // Occupied = people in the zone this step (E+ "During Occupied").
+            let occupied = snapshot
+                .zone_gain_people_sensible
+                .get(zone_name)
+                .is_some_and(|&w| w > 0.0);
+            any_occ |= occupied;
 
             if let Some(&sp) = heat_sp {
                 if zone_temp < sp - self.unmet_tolerance {
                     self.unmet_heating_hours += hours_fraction;
+                    occ_cold |= occupied;
                 }
             }
             if let Some(&sp) = cool_sp {
                 if zone_temp > sp + self.unmet_tolerance {
                     self.unmet_cooling_hours += hours_fraction;
+                    occ_warm |= occupied;
                 }
             }
         }
+        self.unmet_zone_count = self.unmet_zone_count.max(checked);
+        if any_occ {
+            self.occupied_hours += hours_fraction;
+        }
+        if occ_cold {
+            self.occ_unmet_heating_hours += hours_fraction;
+        }
+        if occ_warm {
+            self.occ_unmet_cooling_hours += hours_fraction;
+        }
+        if occ_cold || occ_warm {
+            self.occ_unmet_hours += hours_fraction;
+        }
+    }
+
+    /// Zone-hours the unmet totals are counted over: zones checked x run hours.
+    fn unmet_zone_hours(&self) -> f64 {
+        self.unmet_zone_count as f64 * self.total_timesteps as f64 * self.dt / 3600.0
     }
 
     /// Write the summary report to a text file.
@@ -2474,38 +2519,52 @@ impl SummaryReport {
             self.unmet_cooling_hours
         )?;
 
-        let total_hours = self.total_timesteps as f64 * self.dt / 3600.0;
-        if total_hours > 0.0 {
-            let heat_pct = self.unmet_heating_hours / total_hours * 100.0;
-            let cool_pct = self.unmet_cooling_hours / total_hours * 100.0;
-            writeln!(w)?;
+        let zone_hours = self.unmet_zone_hours();
+        if zone_hours > 0.0 {
+            // The two lines above are ZONE-hours: summed over every zone and
+            // every hour of the run (setback hours included). Their old
+            // "% of occupied hours" divided by the run's hours, and the 90.1
+            // check compared them to a building-hour limit; neither held.
             writeln!(
                 w,
-                "  Heating setpoint met: {:>5.1}% of occupied hours",
-                100.0 - heat_pct
+                "  (zone-hours over {} zones x all hours: heating {:.1}%, cooling {:.1}% of {:.0} zone-hours)",
+                self.unmet_zone_count,
+                self.unmet_heating_hours / zone_hours * 100.0,
+                self.unmet_cooling_hours / zone_hours * 100.0,
+                zone_hours
+            )?;
+            writeln!(w)?;
+            // ASHRAE 90.1 G3.1.2.3 / EnergyPlus "Time Setpoint Not Met During
+            // Occupied": hours in which ANY occupied zone is outside its
+            // setpoint by more than the tolerance.
+            writeln!(
+                w,
+                "  Occupied hours:                     {:>8.1} hr",
+                self.occupied_hours
             )?;
             writeln!(
                 w,
-                "  Cooling setpoint met: {:>5.1}% of occupied hours",
-                100.0 - cool_pct
+                "  Occupied unmet heating (any zone):  {:>8.1} hr",
+                self.occ_unmet_heating_hours
             )?;
-
-            // ASHRAE Standard 90.1 compliance check (300 unmet hours max)
+            writeln!(
+                w,
+                "  Occupied unmet cooling (any zone):  {:>8.1} hr",
+                self.occ_unmet_cooling_hours
+            )?;
+            writeln!(
+                w,
+                "  Occupied unmet, heating or cooling: {:>8.1} hr",
+                self.occ_unmet_hours
+            )?;
             writeln!(w)?;
-            let total_unmet = self.unmet_heating_hours + self.unmet_cooling_hours;
-            if total_unmet <= 300.0 {
-                writeln!(
-                    w,
-                    "  ASHRAE 90.1 Compliance: PASS ({:.0} <= 300 unmet hours)",
-                    total_unmet
-                )?;
-            } else {
-                writeln!(
-                    w,
-                    "  ASHRAE 90.1 Compliance: FAIL ({:.0} > 300 unmet hours)",
-                    total_unmet
-                )?;
-            }
+            writeln!(
+                w,
+                "  ASHRAE 90.1 G3.1.2.3 unmet load hours: {} ({:.0} {} 300 occupied hours)",
+                if self.occ_unmet_hours <= 300.0 { "PASS" } else { "FAIL" },
+                self.occ_unmet_hours,
+                if self.occ_unmet_hours <= 300.0 { "<=" } else { ">" }
+            )?;
         }
         writeln!(w)?;
 
@@ -2905,7 +2964,11 @@ impl SummaryReport {
             self.dt,
             3600.0 / self.dt
         )?;
-        writeln!(w, "  Simulated hours:   {:>8.1} hr", total_hours)?;
+        writeln!(
+            w,
+            "  Simulated hours:   {:>8.1} hr",
+            self.total_timesteps as f64 * self.dt / 3600.0
+        )?;
         writeln!(w)?;
 
         // -- Submeter Breakdown --
@@ -3368,9 +3431,6 @@ impl SummaryReport {
         }
 
         // -- Unmet Hours --
-        let total_hours = self.total_timesteps as f64 * self.dt / 3600.0;
-        let total_unmet = self.unmet_heating_hours + self.unmet_cooling_hours;
-
         writeln!(w, "<h2>Unmet Hours</h2>")?;
         writeln!(w, "<table>")?;
         html_table_row(&mut w, &["", "Hours"], true)?;
@@ -3386,17 +3446,31 @@ impl SummaryReport {
         )?;
         writeln!(w, "</table>")?;
 
-        if total_hours > 0.0 {
-            let compliance_class = if total_unmet <= 300.0 { "pass" } else { "fail" };
-            let compliance_text = if total_unmet <= 300.0 {
-                format!("PASS ({:.0} &le; 300 unmet hours)", total_unmet)
-            } else {
-                format!("FAIL ({:.0} &gt; 300 unmet hours)", total_unmet)
-            };
+        if self.unmet_zone_hours() > 0.0 {
             writeln!(
                 w,
-                "<p>ASHRAE 90.1 Compliance: <span class=\"{}\">{}</span></p>",
-                compliance_class, compliance_text
+                "<p>Zone-hours: summed over {} zones and every hour of the run.</p>",
+                self.unmet_zone_count
+            )?;
+            writeln!(w, "<table>")?;
+            html_table_row(&mut w, &["Occupied (any zone)", "Hours"], true)?;
+            for (label, v) in [
+                ("Occupied hours", self.occupied_hours),
+                ("Unmet heating", self.occ_unmet_heating_hours),
+                ("Unmet cooling", self.occ_unmet_cooling_hours),
+                ("Unmet, heating or cooling", self.occ_unmet_hours),
+            ] {
+                html_table_row(&mut w, &[label, &format!("{:.1}", v)], false)?;
+            }
+            writeln!(w, "</table>")?;
+            let pass = self.occ_unmet_hours <= 300.0;
+            writeln!(
+                w,
+                "<p>ASHRAE 90.1 G3.1.2.3 unmet load hours: <span class=\"{}\">{} ({:.0} {} 300 occupied hours)</span></p>",
+                if pass { "pass" } else { "fail" },
+                if pass { "PASS" } else { "FAIL" },
+                self.occ_unmet_hours,
+                if pass { "&le;" } else { "&gt;" }
             )?;
         }
 
@@ -3777,6 +3851,18 @@ impl SummaryReport {
         writeln!(w, "Unmet Cooling Hours,{:.1}", self.unmet_cooling_hours)?;
         let total_unmet = self.unmet_heating_hours + self.unmet_cooling_hours;
         writeln!(w, "Total Unmet Hours,{:.1}", total_unmet)?;
+        writeln!(w, "Occupied Hours,{:.1}", self.occupied_hours)?;
+        writeln!(
+            w,
+            "Occupied Unmet Heating Hours,{:.1}",
+            self.occ_unmet_heating_hours
+        )?;
+        writeln!(
+            w,
+            "Occupied Unmet Cooling Hours,{:.1}",
+            self.occ_unmet_cooling_hours
+        )?;
+        writeln!(w, "Occupied Unmet Hours,{:.1}", self.occ_unmet_hours)?;
 
         w.flush()?;
         Ok(())
@@ -4129,6 +4215,36 @@ mod tests {
 
         // Should still be 1.0 (second snapshot was within tolerance)
         assert!((report.unmet_heating_hours - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn occupied_unmet_hours_count_building_hours_with_any_occupied_zone_out() {
+        // Two zones; ASHRAE 90.1 G3.1.2.3 / E+ "During Occupied" count an hour
+        // once when ANY occupied zone misses, and ignore unoccupied zones.
+        let sp: HashMap<String, f64> = [("A".to_string(), 24.0), ("B".to_string(), 24.0)].into();
+        let heat: HashMap<String, f64> = [("A".to_string(), 21.0), ("B".to_string(), 21.0)].into();
+        let mut report = SummaryReport::new(heat, sp);
+        let step = |hour: u32, ta: f64, tb: f64, occ_a: bool, occ_b: bool| {
+            let mut s = OutputSnapshot::new(1, 1, hour, 1, 3600.0);
+            s.zone_temperature.insert("A".to_string(), ta);
+            s.zone_temperature.insert("B".to_string(), tb);
+            s.zone_gain_people_sensible.insert("A".to_string(), if occ_a { 80.0 } else { 0.0 });
+            s.zone_gain_people_sensible.insert("B".to_string(), if occ_b { 80.0 } else { 0.0 });
+            s
+        };
+        report.add_snapshot(&step(1, 25.0, 25.0, true, true)); // both warm, occupied: 1 h
+        report.add_snapshot(&step(2, 25.0, 22.0, true, true)); // A warm: 1 h
+        report.add_snapshot(&step(3, 25.0, 25.0, false, false)); // warm but empty: 0
+        report.add_snapshot(&step(4, 22.0, 20.0, true, false)); // B cold but empty: 0
+        report.add_snapshot(&step(5, 20.0, 25.0, true, true)); // A cold, B warm: 1 h each, 1 either
+        assert!((report.occupied_hours - 4.0).abs() < 1e-9);
+        assert!((report.occ_unmet_cooling_hours - 3.0).abs() < 1e-9);
+        assert!((report.occ_unmet_heating_hours - 1.0).abs() < 1e-9);
+        assert!((report.occ_unmet_hours - 3.0).abs() < 1e-9);
+        // Zone-hours keep counting every zone and hour, occupied or not.
+        assert!((report.unmet_cooling_hours - 6.0).abs() < 1e-9);
+        assert!((report.unmet_heating_hours - 2.0).abs() < 1e-9);
+        assert_eq!(report.unmet_zone_count, 2);
     }
 
     #[test]
