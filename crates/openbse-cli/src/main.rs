@@ -6742,13 +6742,21 @@ fn simulate_all_loops(
                         .unwrap_or(vav_max_flow * 0.3);
                     let min_flow_frac = li.terminal_min_flow.get(zone_name).copied().unwrap_or(0.3);
                     let min_flow = vav_max_flow * min_flow_frac;
-                    let mode = if zone_temp_init < heat_sp {
-                        HvacMode::Heating
-                    } else if zone_temp_init > cool_sp {
-                        HvacMode::Cooling
-                    } else {
-                        HvacMode::Deadband
-                    };
+                    // The terminal takes the mode the signal builder used
+                    // (the free-floating predictor, fixed for the step).
+                    // Deciding it again from the start-of-step temperature
+                    // held predicted-cooling zones at minimum flow + reheat
+                    // while the AHU carried the builder's flows: zones
+                    // overheated and the iteration could not converge.
+                    let mode = predictor_modes.get(zone_name).copied().unwrap_or(
+                        if zone_temp_init < heat_sp {
+                            HvacMode::Heating
+                        } else if zone_temp_init > cool_sp {
+                            HvacMode::Cooling
+                        } else {
+                            HvacMode::Deadband
+                        },
+                    );
                     let control_signal = if li.fixed_cooling_sat {
                         // Terminal-reheat systems (ASHRAE 140 §11 AE300/AE400):
                         // the central coil delivers a fixed cold-deck temperature
