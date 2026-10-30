@@ -1491,6 +1491,14 @@ pub fn build_vav_signals(
         // `vav_flow_relax_for_dt`). It applies across modes: the drop from
         // full flow to minimum when a zone dips into the deadband is half of
         // the limit cycle. The fixed-SAT path keeps its own terminal control.
+        // Within the step, blend with the previous HVAC iteration's flow:
+        // the cooling error reads the converging temperature, and an
+        // undamped fixed-point iteration overshot (loop gain ~2.4), leaving
+        // ~20% of steps unconverged. Same fixed point, no overshoot.
+        let zone_flow = match li.vav_step_flows.get(zone_name) {
+            Some(&prev_iter) if !li.fixed_cooling_sat => 0.5 * (zone_flow + prev_iter),
+            _ => zone_flow,
+        };
         let zone_flow = match li.vav_prev_flows.get(zone_name) {
             Some(&prev) if !li.fixed_cooling_sat && li.vav_flow_relax < 1.0 => {
                 let min_flow = design_flow * li.min_vav_fraction;
