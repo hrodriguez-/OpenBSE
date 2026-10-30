@@ -149,7 +149,9 @@ pub struct LoopInfo {
 /// inside the band without overshooting. The overshoot per step grows with
 /// the step length, so the fraction scales down with `dt`.
 pub fn vav_flow_relax_for_dt(dt: f64) -> f64 {
-    (0.4 * 900.0 / dt.max(1.0)).min(1.0)
+    // Variant: no between-step limit while the error is implicit.
+    let _ = dt;
+    1.0
 }
 
 /// Control role of a component in a signal builder's coil dispatch.
@@ -1425,12 +1427,14 @@ pub fn build_vav_signals(
                     // heating ramp (#170) — read from the converging
                     // temperature it chased its own cooling and the damper
                     // flipped min/max between iterations.
-                    let start_temp = ctx
-                        .zone_start_temps
-                        .get(zone_name)
-                        .copied()
-                        .unwrap_or(zone_temp);
-                    let error = (start_temp - (cool_sp - 0.25)).clamp(0.0, 0.5);
+                    // Implicit: the error reads the CONVERGING (end-of-step)
+                    // temperature, so the HVAC iteration settles where the
+                    // zone ends the step inside the band. The start-of-step
+                    // reading set the flow from a temperature 15 minutes old
+                    // and zones overheated at part flow (B094: 94% of warm
+                    // occupied steps). The iteration's 50/50 supply blend
+                    // keeps it from flipping (loop gain ~2.4 < 3).
+                    let error = (zone_temp - (cool_sp - 0.25)).clamp(0.0, 0.5);
                     let m_error = min_flow + (design_flow - min_flow) * (error / 0.5);
                     if cool_load > 100.0 {
                         // m = Q / (Cp × (T_zone - SAT))
@@ -2176,10 +2180,8 @@ mod tests {
         // Limited: 40% of the way from full flow toward the minimum.
         let expect = 1.0 + 0.4 * (min_flow - 1.0);
         assert!((flow(0.4, Some(1.0)) - expect).abs() < 1e-12);
-        // The rate scales with the timestep: 40% per 15 min, capped at 1.
-        assert!((vav_flow_relax_for_dt(900.0) - 0.4).abs() < 1e-12);
-        assert!((vav_flow_relax_for_dt(3600.0) - 0.1).abs() < 1e-12);
-        assert_eq!(vav_flow_relax_for_dt(60.0), 1.0);
+        // Implicit-error variant: no between-step limit by default.
+        assert_eq!(vav_flow_relax_for_dt(900.0), 1.0);
     }
 
     #[test]
