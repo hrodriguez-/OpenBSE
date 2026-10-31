@@ -120,6 +120,10 @@ pub struct LoopInfo {
     /// the terminal-reheat control size the minimum airflow per zone (constant
     /// volume = 1.0). Empty for loops without VAV terminal boxes.
     pub terminal_min_flow: HashMap<String, f64>,
+    /// Per-zone VAV terminal maximum flow fraction during reheat (zone_name →
+    /// fraction, the box's `max_reheat_fraction`). Zones without an entry ramp
+    /// to the G36 dual-maximum 0.5.
+    pub terminal_max_reheat: HashMap<String, f64>,
     /// Fixed minimum outdoor-air mass flow [kg/s] (optional). When set, the OA
     /// fraction is this flow divided by the current total supply flow, so a VAV
     /// system throttling down draws a rising OA fraction (fixed OA volume).
@@ -1509,9 +1513,21 @@ pub fn build_vav_signals(
                     }
                 }
                 HvacMode::Heating => {
+                    // The box's own heating maximum (E+ Damper Heating Action):
+                    // at its minimum fraction the box reheats at minimum flow
+                    // (E+ "Normal"), and the fan must carry only that. Read as
+                    // 0.5 here while the box held its minimum, the AHU moved
+                    // the dual-maximum ramp's air on top (fans +20 % in
+                    // heating months against an E+ twin with Normal action).
+                    let heat_max = li
+                        .terminal_max_reheat
+                        .get(zone_name)
+                        .copied()
+                        .unwrap_or(v_heat_max_frac)
+                        .max(li.min_vav_fraction);
                     let error = (heat_sp - zone_temp).clamp(0.0, 5.0);
-                    let frac = li.min_vav_fraction
-                        + (v_heat_max_frac - li.min_vav_fraction) * (error / 5.0);
+                    let frac =
+                        li.min_vav_fraction + (heat_max - li.min_vav_fraction) * (error / 5.0);
                     design_flow * frac
                 }
                 HvacMode::Deadband => design_flow * li.min_vav_fraction,
@@ -2049,6 +2065,7 @@ mod tests {
             cooling_part_load_cd: 0.15,
             terminal_boxes: HashMap::new(),
             terminal_min_flow: HashMap::new(),
+            terminal_max_reheat: HashMap::new(),
             min_oa_flow_mass: None,
             std_air_density: 1.204,
             dd_boxes: HashMap::new(),

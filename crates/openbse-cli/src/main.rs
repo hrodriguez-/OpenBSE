@@ -402,6 +402,7 @@ fn build_loop_infos(
             // Build terminal box map: zone_name -> component_name
             let mut terminal_boxes: HashMap<String, String> = HashMap::new();
             let mut terminal_min_flow: HashMap<String, f64> = HashMap::new();
+            let mut terminal_max_reheat: HashMap<String, f64> = HashMap::new();
             let mut dd_boxes: HashMap<String, openbse_components::dual_duct_box::DualDuctBox> =
                 HashMap::new();
             for zc in &al.zone_terminals {
@@ -410,6 +411,9 @@ fn build_loop_infos(
                         openbse_io::input::TerminalInput::VavBox(vb) => {
                             terminal_boxes.insert(zc.zone.clone(), vb.name.clone());
                             terminal_min_flow.insert(zc.zone.clone(), vb.min_flow_fraction);
+                            if let Some(f) = vb.max_reheat_fraction {
+                                terminal_max_reheat.insert(zc.zone.clone(), f);
+                            }
                         }
                         openbse_io::input::TerminalInput::PfpBox(pb) => {
                             terminal_boxes.insert(zc.zone.clone(), pb.name.clone());
@@ -458,6 +462,7 @@ fn build_loop_infos(
                 cooling_part_load_cd: al.controls.cooling_part_load_cd,
                 terminal_boxes,
                 terminal_min_flow,
+                terminal_max_reheat,
                 dd_boxes,
                 heat_recovery_name,
                 dcv: al.dcv,
@@ -7597,6 +7602,7 @@ mod tests {
             cooling_part_load_cd: 0.15,
             terminal_boxes: HashMap::new(),
             terminal_min_flow: HashMap::new(),
+            terminal_max_reheat: HashMap::new(),
             dd_boxes: HashMap::new(),
             explicit_min_oa: false,
             heat_recovery_name: None,
@@ -7639,6 +7645,7 @@ mod tests {
             cooling_part_load_cd: 0.15,
             terminal_boxes: HashMap::new(),
             terminal_min_flow: HashMap::new(),
+            terminal_max_reheat: HashMap::new(),
             dd_boxes: HashMap::new(),
             explicit_min_oa: false,
             heat_recovery_name: None,
@@ -8823,6 +8830,7 @@ mod tests_datacenter {
             cooling_part_load_cd: 0.15,
             terminal_boxes: HashMap::new(),
             terminal_min_flow: HashMap::new(),
+            terminal_max_reheat: HashMap::new(),
             dd_boxes: HashMap::new(),
             explicit_min_oa: false,
             heat_recovery_name: None,
