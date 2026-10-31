@@ -322,30 +322,16 @@ pub struct SignalCtx<'a> {
 // 0.2 K comfort tolerance (100-building benchmark, 2026-10-31). A wider band
 // keeps the per-step loop gain below 1; the integral term, updated once per
 // timestep, removes the offset a wide band would leave (a real VAV box is
-// PI-controlled).
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
+// PI-controlled). Bands of 1-3 K and integral times of 15-30 min gave the
+// same result on the benchmark buildings (occupied cooling unmet 97-131 h,
+// from 566-1,237 h); the load-line flow stays as a floor under it (without
+// it unmet hours doubled).
 
 /// Proportional band of the VAV cooling damper [K]: error for full stroke.
-pub fn vav_cool_pband() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_f64("OPENBSE_VAV_PBAND", 2.0))
-}
+pub const VAV_COOL_PBAND_K: f64 = 2.0;
 
 /// Integral time of the VAV cooling damper [s].
-pub fn vav_cool_ti_s() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_f64("OPENBSE_VAV_TI_S", 1800.0))
-}
-
-fn vav_cool_load_floor() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("OPENBSE_VAV_NOLOAD").is_err())
-}
+pub const VAV_COOL_TI_S: f64 = 1800.0;
 
 /// Advance each zone's VAV cooling integral by one timestep from its
 /// start-of-timestep error against the active cooling setpoint, clamped to
@@ -356,11 +342,10 @@ pub fn update_vav_cool_integral(
     cool_sp: &HashMap<String, f64>,
     dt_s: f64,
 ) {
-    let (band, ti) = (vav_cool_pband(), vav_cool_ti_s());
     for (zone, &t0) in start_temps {
         if let Some(&sp) = cool_sp.get(zone) {
             let i = integral.entry(zone.clone()).or_insert(0.0);
-            *i = (*i + dt_s / ti * (t0 - sp) / band).clamp(0.0, 1.0);
+            *i = (*i + dt_s / VAV_COOL_TI_S * (t0 - sp) / VAV_COOL_PBAND_K).clamp(0.0, 1.0);
         }
     }
 }
@@ -372,7 +357,7 @@ fn vav_cool_fraction(ctx: &SignalCtx, zone: &str, start_temp: f64, cool_sp: f64)
     match ctx.vav_cool_integral {
         Some(integral) => {
             let i = integral.get(zone).copied().unwrap_or(0.0);
-            ((start_temp - cool_sp) / vav_cool_pband() + i).clamp(0.0, 1.0)
+            ((start_temp - cool_sp) / VAV_COOL_PBAND_K + i).clamp(0.0, 1.0)
         }
         None => (start_temp - (cool_sp - 0.25)).clamp(0.0, 0.5) / 0.5,
     }
@@ -1485,12 +1470,7 @@ pub fn build_vav_signals(
                         // m = Q / (Cp × (T_zone - SAT))
                         let dt = (zone_temp - sat_setpoint).max(1.0);
                         let m_needed = cool_load / (cp * dt);
-                        let flow = if vav_cool_load_floor() || ctx.vav_cool_integral.is_none() {
-                            m_needed.max(m_error)
-                        } else {
-                            m_error
-                        }
-                        .clamp(min_flow, design_flow);
+                        let flow = m_needed.max(m_error).clamp(min_flow, design_flow);
                         let frac = ((flow - min_flow) / (design_flow - min_flow).max(0.001))
                             .clamp(0.0, 1.0);
                         max_cooling_demand = max_cooling_demand.max(frac);
@@ -2436,5 +2416,68 @@ mod tests {
             data_center_supply_flow(&li, design, HvacMode::Cooling, 1.0e6, 24.0, w),
             design
         );
+    }
+
+    #[test]
+    fn vav_cool_integral_accumulates_error_and_drains_below_setpoint() {
+        let sp: HashMap<String, f64> = [("Z".to_string(), 24.0)].into();
+        let mut integral = HashMap::new();
+        // 0.5 K warm for one 15-min step: dt/Ti * e/band = 0.5 * 0.25.
+        let warm: HashMap<String, f64> = [("Z".to_string(), 24.5)].into();
+        update_vav_cool_integral(&mut integral, &warm, &sp, 900.0);
+        assert!((integral["Z"] - 0.125).abs() < 1e-12);
+        // Clamped to the damper range however long the zone stays warm.
+        for _ in 0..100 {
+            update_vav_cool_integral(&mut integral, &warm, &sp, 900.0);
+        }
+        assert_eq!(integral["Z"], 1.0);
+        // Below setpoint it drains, never below zero.
+        let cool: HashMap<String, f64> = [("Z".to_string(), 22.0)].into();
+        for _ in 0..100 {
+            update_vav_cool_integral(&mut integral, &cool, &sp, 900.0);
+        }
+        assert_eq!(integral["Z"], 0.0);
+    }
+
+    #[test]
+    fn vav_cool_fraction_is_pi_with_an_integral_else_the_old_band() {
+        let empty = HashMap::new();
+        let modes = HashMap::new();
+        let integral: HashMap<String, f64> = [("Z".to_string(), 0.3)].into();
+        let ctx = SignalCtx {
+            zone_temps: &empty,
+            zone_start_temps: &empty,
+            zone_heat_sp: &empty,
+            zone_cool_sp: &empty,
+            zone_design_flows: &empty,
+            zone_cooling_loads: &empty,
+            zone_heating_loads: &empty,
+            zone_humidity_ratios: &empty,
+            zone_max_rh: &empty,
+            zone_min_rh: &empty,
+            zone_thermal_caps: &empty,
+            zone_return_temps: &empty,
+            zone_multipliers: &HashMap::new(),
+            predictor_modes: &modes,
+            t_outdoor: 30.0,
+            raw_t_outdoor: 30.0,
+            w_outdoor: 0.01,
+            effective_min_oa: 0.15,
+            schedule_mgr: None,
+            hour: 12,
+            day_of_week: 1,
+            vav_cool_integral: Some(&integral),
+        };
+        // P on 0.5 K over a 2 K band plus the carried 0.3.
+        assert!((vav_cool_fraction(&ctx, "Z", 24.5, 24.0) - 0.55).abs() < 1e-12);
+        // At setpoint the integral alone holds the damper.
+        assert!((vav_cool_fraction(&ctx, "Z", 24.0, 24.0) - 0.3).abs() < 1e-12);
+        // Without the integral: full stroke over setpoint -0.25 .. +0.25 K.
+        let old = SignalCtx {
+            vav_cool_integral: None,
+            ..ctx
+        };
+        assert_eq!(vav_cool_fraction(&old, "Z", 24.25, 24.0), 1.0);
+        assert!((vav_cool_fraction(&old, "Z", 24.0, 24.0) - 0.5).abs() < 1e-12);
     }
 }
