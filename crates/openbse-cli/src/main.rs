@@ -52,6 +52,20 @@ struct Args {
     #[arg(short, long, value_name = "OUTPUT")]
     output: Option<PathBuf>,
 
+    /// Write the full per-timestep results CSV (the default; kept so callers
+    /// that ask for it explicitly still parse).
+    #[arg(long, conflicts_with = "no_timeseries")]
+    timeseries: bool,
+
+    /// Skip the per-timestep results CSV and don't hold per-timestep results in
+    /// memory. The summary report (txt/html/csv), sizing, custom outputs and
+    /// .err are still written. An annual sub-hourly model keeps every
+    /// component output for every timestep until the CSV write: ~1.2 GB at 1
+    /// step/h and ~4-5 GB at 4 steps/h for a 15-zone VAV office, which swaps a
+    /// small server for longer than the simulation itself takes.
+    #[arg(long)]
+    no_timeseries: bool,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -667,6 +681,7 @@ fn main() -> Result<()> {
         .output
         .clone()
         .unwrap_or_else(|| input_dir.join(format!("{}_results.csv", input_stem)));
+    let write_timeseries = !args.no_timeseries;
     // Every other output follows the results CSV, so `--output` keeps a run
     // entirely out of the source tree (CI and the shipped-model checks rely on this).
     let output_dir = output_path
@@ -2558,7 +2573,13 @@ fn main() -> Result<()> {
 
         // ── 7. Run the simulation loop ──────────────────────────────────────────
         info!("Starting simulation...");
-        let mut results: Vec<TimestepResult> = Vec::with_capacity(total_timesteps as usize);
+        // Per-timestep results are only needed for the timeseries CSV and the
+        // parametric summary; the summary report and custom outputs accumulate
+        // from each snapshot as the loop runs.
+        let keep_results = write_timeseries || !single_run_mode;
+        let mut results: Vec<TimestepResult> =
+            Vec::with_capacity(if keep_results { total_timesteps as usize } else { 0 });
+        let mut timesteps_run: usize = 0;
         let mut sim_time = start_hour as f64 * 3600.0;
 
         // Night-cycle timers: per-loop remaining ON time [seconds].
@@ -5313,7 +5334,10 @@ fn main() -> Result<()> {
                         recorder.record_timestep(env, &ctx.timestep);
                     }
 
-                    results.push(result);
+                    timesteps_run += 1;
+                    if keep_results {
+                        results.push(result);
+                    }
                 } else {
                     // ═══════════════════════════════════════════════════════════
                     // HVAC-ONLY SIMULATION (no envelope)
@@ -5479,14 +5503,17 @@ fn main() -> Result<()> {
                         report.add_snapshot(&snapshot);
                     }
 
-                    results.push(result);
+                    timesteps_run += 1;
+                    if keep_results {
+                        results.push(result);
+                    }
                 }
 
                 sim_time += dt;
             }
         }
 
-        info!("Simulation complete: {} timesteps", results.len());
+        info!("Simulation complete: {} timesteps", timesteps_run);
 
         // Run-time check findings (#160) join the validation messages in
         // the `.err` file; severe ones don't cancel a finished run.
@@ -5518,7 +5545,9 @@ fn main() -> Result<()> {
         // In single-run mode: write to the default output path.
         // In parametric mode: skip the default write here (per-run CSVs written at loop end).
         if single_run_mode {
-            if !results.is_empty() {
+            if !write_timeseries {
+                info!("Per-timestep CSV skipped (--no-timeseries); summary report still written.");
+            } else if !results.is_empty() {
                 write_csv(&results, &output_path).with_context(|| {
                     format!("Failed to write results to {}", output_path.display())
                 })?;
@@ -5642,7 +5671,7 @@ fn main() -> Result<()> {
         if !single_run_mode {
             // In parametric mode, also write per-run CSV with the run name embedded
             let run_csv = output_dir.join(format!("{}_{}_results.csv", input_stem, run_name));
-            if !results.is_empty() {
+            if write_timeseries && !results.is_empty() {
                 write_csv(&results, &run_csv).with_context(|| {
                     format!("Failed to write run results to {}", run_csv.display())
                 })?;
@@ -6688,13 +6717,21 @@ fn simulate_all_loops(
                         .unwrap_or(vav_max_flow * 0.3);
                     let min_flow_frac = li.terminal_min_flow.get(zone_name).copied().unwrap_or(0.3);
                     let min_flow = vav_max_flow * min_flow_frac;
-                    let mode = if zone_temp_init < heat_sp {
-                        HvacMode::Heating
-                    } else if zone_temp_init > cool_sp {
-                        HvacMode::Cooling
-                    } else {
-                        HvacMode::Deadband
-                    };
+                    // The terminal takes the mode the signal builder used
+                    // (the free-floating predictor, fixed for the step).
+                    // Deciding it again from the start-of-step temperature
+                    // held predicted-cooling zones at minimum flow + reheat
+                    // while the AHU carried the builder's flows: zones
+                    // overheated and the iteration could not converge.
+                    let mode = predictor_modes.get(zone_name).copied().unwrap_or(
+                        if zone_temp_init < heat_sp {
+                            HvacMode::Heating
+                        } else if zone_temp_init > cool_sp {
+                            HvacMode::Cooling
+                        } else {
+                            HvacMode::Deadband
+                        },
+                    );
                     let control_signal = if li.fixed_cooling_sat {
                         // Terminal-reheat systems (ASHRAE 140 §11 AE300/AE400):
                         // the central coil delivers a fixed cold-deck temperature
