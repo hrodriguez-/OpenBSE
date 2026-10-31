@@ -2577,8 +2577,11 @@ fn main() -> Result<()> {
         // parametric summary; the summary report and custom outputs accumulate
         // from each snapshot as the loop runs.
         let keep_results = write_timeseries || !single_run_mode;
-        let mut results: Vec<TimestepResult> =
-            Vec::with_capacity(if keep_results { total_timesteps as usize } else { 0 });
+        let mut results: Vec<TimestepResult> = Vec::with_capacity(if keep_results {
+            total_timesteps as usize
+        } else {
+            0
+        });
         let mut timesteps_run: usize = 0;
         let mut sim_time = start_hour as f64 * 3600.0;
 
