@@ -2594,6 +2594,8 @@ fn main() -> Result<()> {
         // turn off, let the zone crash, and repeat — wasting energy recharging
         // thermal mass each cycle.
         let mut nightcycle_timers: HashMap<String, f64> = HashMap::new();
+        // VAV cooling damper integral per zone (openbse_airloop PI control).
+        let mut vav_cool_integral: HashMap<String, f64> = HashMap::new();
         // Air each zone last returned to loops that carry lighting
         // return-air heat [kg/s] (#51), carried over between timesteps.
         let mut return_air_flows: HashMap<String, f64> = HashMap::new();
@@ -2789,6 +2791,7 @@ fn main() -> Result<()> {
                             &warmup_max_rh,
                             &warmup_min_rh,
                             &warmup_dc_return,
+                            None,
                         );
 
                         // Skip plant loop during warmup — it only affects energy
@@ -2874,6 +2877,7 @@ fn main() -> Result<()> {
             sim_time = start_hour as f64 * 3600.0;
             // Reset nightcycle timers (start fresh for actual simulation)
             nightcycle_timers.clear();
+            vav_cool_integral.clear();
         }
 
         // ── Pre-compute plant loop simulation order (topological sort) ──────────
@@ -3363,6 +3367,12 @@ fn main() -> Result<()> {
                             .into_iter()
                             .map(|(zone, (mode, _))| (zone, mode))
                             .collect();
+                        openbse_airloop::update_vav_cool_integral(
+                            &mut vav_cool_integral,
+                            &initial_zone_temps,
+                            active_cooling_setpoints,
+                            dt,
+                        );
                         for hvac_iter in 0..MAX_HVAC_ITER {
                             // The hot-aisle return follows the supply the units are
                             // producing now, not last timestep's (CRAC-5 / #62).
@@ -3409,6 +3419,7 @@ fn main() -> Result<()> {
                                     &zone_max_rh,
                                     &zone_min_rh,
                                     &zone_return_temps,
+                                    Some(&vav_cool_integral),
                                 );
 
                             // Radiant panels run before the plant, so the plant
@@ -5750,6 +5761,7 @@ fn simulate_all_loops(
     zone_max_rh: &HashMap<String, f64>,
     zone_min_rh: &HashMap<String, f64>,
     zone_return_temps: &HashMap<String, f64>,
+    vav_cool_integral: Option<&HashMap<String, f64>>,
 ) -> (TimestepResult, ZoneSupplies, HashMap<String, f64>) {
     let w_outdoor = ctx.outdoor_air.w;
     let mut all_outputs: HashMap<String, HashMap<String, f64>> = HashMap::new();
@@ -6114,6 +6126,7 @@ fn simulate_all_loops(
             schedule_mgr,
             hour,
             day_of_week,
+            vav_cool_integral,
         };
 
         let mut signals = match li.system_type {
@@ -7694,6 +7707,7 @@ mod tests {
             schedule_mgr: None,
             hour: 0,
             day_of_week: 0,
+            vav_cool_integral: None,
         };
         let signals = build_fcu_signals(&li, &ctx);
 
@@ -7763,6 +7777,7 @@ mod tests {
             schedule_mgr: None,
             hour: 0,
             day_of_week: 0,
+            vav_cool_integral: None,
         };
         let signals = build_fcu_signals(&li, &ctx);
 
@@ -7993,6 +8008,7 @@ mod tests {
             schedule_mgr: None,
             hour: 0,
             day_of_week: 0,
+            vav_cool_integral: None,
         };
         let signals_humid = build_psz_signals(&li, &ctx_humid);
         let oa_frac_humid = signals_humid.oa_fraction.unwrap_or(0.0);
@@ -8239,6 +8255,7 @@ mod tests {
             schedule_mgr: None,
             hour: 0,
             day_of_week: 0,
+            vav_cool_integral: None,
         };
         let signals = build_psz_signals(&li, &ctx);
 
@@ -8306,6 +8323,7 @@ mod tests {
             schedule_mgr: None,
             hour: 0,
             day_of_week: 0,
+            vav_cool_integral: None,
         };
         let signals = build_psz_signals(&li, &ctx);
 
@@ -8864,6 +8882,7 @@ mod tests_datacenter {
             schedule_mgr: None,
             hour: 0,
             day_of_week: 0,
+            vav_cool_integral: None,
         };
         let signals = build_crac_signals(&li, &ctx);
 
@@ -8925,6 +8944,7 @@ mod tests_datacenter {
             schedule_mgr: None,
             hour: 0,
             day_of_week: 0,
+            vav_cool_integral: None,
         };
         let signals = build_crah_signals(&li, &ctx);
 

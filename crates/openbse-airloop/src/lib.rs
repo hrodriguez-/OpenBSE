@@ -306,6 +306,76 @@ pub struct SignalCtx<'a> {
     pub hour: u32,
     /// Day of week [0-6] for schedule lookups.
     pub day_of_week: u32,
+    /// Integral term of each zone's VAV cooling damper PI control (fraction
+    /// of the minimum-to-maximum flow range), carried between timesteps and
+    /// updated once per timestep by `update_vav_cool_integral`. None keeps
+    /// the proportional-only damper (sizing, unit tests).
+    pub vav_cool_integral: Option<&'a HashMap<String, f64>>,
+}
+
+// ── VAV cooling damper PI control ──
+//
+// A proportional damper on the start-of-timestep error, with full stroke over
+// 0.5 K, limit-cycled: in a perimeter zone a full stroke moves the zone ~1.6 K
+// within a 15-minute step (loop gain ~3), so the zone sawed 22.6 -> 23.5 ->
+// 24.35 C around a 24 C setpoint, ending a third of its steps beyond the
+// 0.2 K comfort tolerance (100-building benchmark, 2026-10-31). A wider band
+// keeps the per-step loop gain below 1; the integral term, updated once per
+// timestep, removes the offset a wide band would leave (a real VAV box is
+// PI-controlled).
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Proportional band of the VAV cooling damper [K]: error for full stroke.
+pub fn vav_cool_pband() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_f64("OPENBSE_VAV_PBAND", 2.0))
+}
+
+/// Integral time of the VAV cooling damper [s].
+pub fn vav_cool_ti_s() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_f64("OPENBSE_VAV_TI_S", 1800.0))
+}
+
+fn vav_cool_load_floor() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("OPENBSE_VAV_NOLOAD").is_err())
+}
+
+/// Advance each zone's VAV cooling integral by one timestep from its
+/// start-of-timestep error against the active cooling setpoint, clamped to
+/// the damper range (anti-windup). Zones below setpoint drain it.
+pub fn update_vav_cool_integral(
+    integral: &mut HashMap<String, f64>,
+    start_temps: &HashMap<String, f64>,
+    cool_sp: &HashMap<String, f64>,
+    dt_s: f64,
+) {
+    let (band, ti) = (vav_cool_pband(), vav_cool_ti_s());
+    for (zone, &t0) in start_temps {
+        if let Some(&sp) = cool_sp.get(zone) {
+            let i = integral.entry(zone.clone()).or_insert(0.0);
+            *i = (*i + dt_s / ti * (t0 - sp) / band).clamp(0.0, 1.0);
+        }
+    }
+}
+
+/// Cooling damper position (0 = minimum flow, 1 = maximum) from the
+/// start-of-timestep error: PI when the integral is carried, else the
+/// proportional band centred on the setpoint.
+fn vav_cool_fraction(ctx: &SignalCtx, zone: &str, start_temp: f64, cool_sp: f64) -> f64 {
+    match ctx.vav_cool_integral {
+        Some(integral) => {
+            let i = integral.get(zone).copied().unwrap_or(0.0);
+            ((start_temp - cool_sp) / vav_cool_pband() + i).clamp(0.0, 1.0)
+        }
+        None => (start_temp - (cool_sp - 0.25)).clamp(0.0, 0.5) / 0.5,
+    }
 }
 /// A zone's mode for this timestep: the predictor's, held across the HVAC
 /// iteration, else from the zone temperature. Taken from the in-iteration
@@ -1408,13 +1478,19 @@ pub fn build_vav_signals(
                         .get(zone_name)
                         .copied()
                         .unwrap_or(zone_temp);
-                    let error = (start_temp - (cool_sp - 0.25)).clamp(0.0, 0.5);
-                    let m_error = min_flow + (design_flow - min_flow) * (error / 0.5);
+                    let m_error = min_flow
+                        + (design_flow - min_flow)
+                            * vav_cool_fraction(ctx, zone_name, start_temp, cool_sp);
                     if cool_load > 100.0 {
                         // m = Q / (Cp × (T_zone - SAT))
                         let dt = (zone_temp - sat_setpoint).max(1.0);
                         let m_needed = cool_load / (cp * dt);
-                        let flow = m_needed.max(m_error).clamp(min_flow, design_flow);
+                        let flow = if vav_cool_load_floor() || ctx.vav_cool_integral.is_none() {
+                            m_needed.max(m_error)
+                        } else {
+                            m_error
+                        }
+                        .clamp(min_flow, design_flow);
                         let frac = ((flow - min_flow) / (design_flow - min_flow).max(0.001))
                             .clamp(0.0, 1.0);
                         max_cooling_demand = max_cooling_demand.max(frac);
@@ -2057,6 +2133,7 @@ mod tests {
                 schedule_mgr: None,
                 hour: 0,
                 day_of_week: 0,
+                vav_cool_integral: None,
             }
         }
     }
