@@ -200,6 +200,14 @@ pub trait AirComponent: std::fmt::Debug {
     /// Set the nominal capacity (called during autosizing).
     fn set_nominal_capacity(&mut self, _cap: f64) {}
 
+    /// Rated sensible heat ratio of a coil whose `nominal_capacity` is a
+    /// TOTAL (sensible + latent) capacity, such as a DX cooling coil. A coil
+    /// autosized from a sensible duty needs duty / SHR of total capacity to
+    /// deliver it. None for coils whose capacity is sensible.
+    fn rated_sensible_heat_ratio(&self) -> Option<f64> {
+        None
+    }
+
     /// Primary (air-handler) air mass flow a reheat terminal passes while
     /// heating [kg/s]. Reheat sizing must warm this air from the AHU supply
     /// temperature to the zone, on top of the zone's own heating load

@@ -626,6 +626,10 @@ impl AirComponent for CoolingCoilDX {
         self.rated_capacity = cap;
     }
 
+    fn rated_sensible_heat_ratio(&self) -> Option<f64> {
+        Some(self.rated_shr.clamp(0.5, 1.0))
+    }
+
     fn unsized_fields(&self) -> Vec<&'static str> {
         openbse_core::types::autosize_fields([
             ("capacity", self.rated_capacity),

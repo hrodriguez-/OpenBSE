@@ -296,6 +296,31 @@ fn off_cycle_outdoor_air_load(
     oa_fraction * flow_capacity_rate * (t_outdoor - t_zone)
 }
 
+/// Design loads [W] a single-zone unit's coils carry beyond the zone's own
+/// peak: the minimum outdoor air, heated from the heating design temperature
+/// or cooled from the cooling design temperature to the zone, and (cooling
+/// only) the supply fan's heat. Returned as (heating, cooling), both >= 0.
+///
+/// The zone peaks exclude the unit's outdoor air because the loop, not the
+/// zone, conditions it. Sized on the zone peak alone a core zone's furnace
+/// could not even temper its ventilation air, and a DX coil lost a quarter of
+/// its sensible capacity to moisture it was never sized for.
+fn single_zone_coil_extra_design_load(
+    oa_mass_flow: f64,
+    supply_mass_flow: f64,
+    supply_fan_dt: f64,
+    t_outdoor_heat: f64,
+    t_outdoor_cool: f64,
+) -> (f64, f64) {
+    let cp_air = 1005.0_f64;
+    let (t_zone_heat, t_zone_cool) = (21.0_f64, 24.0_f64);
+    let oa = oa_mass_flow.clamp(0.0, supply_mass_flow.max(0.0));
+    let heat = oa * cp_air * (t_zone_heat - t_outdoor_heat).max(0.0);
+    let cool = oa * cp_air * (t_outdoor_cool - t_zone_cool).max(0.0)
+        + supply_mass_flow.max(0.0) * cp_air * supply_fan_dt.max(0.0);
+    (heat, cool)
+}
+
 /// Supply flow [kg/s] of a single-zone VAV unit: the flow that meets the
 /// zone's cooling load [W] with the supply at its coldest, `cooling_dt` below
 /// the setpoint, bounded by the minimum fraction and the design flow. With no
@@ -1738,6 +1763,10 @@ fn main() -> Result<()> {
                 // Build a map: component_name -> (loop_flow [m³/s], loop_heat [W], loop_cool [W])
                 let air_density = site_standard_air_density(&model);
                 let mut loop_comp_sizing: HashMap<String, (f64, f64, f64)> = HashMap::new();
+                // Components whose loop cooling duty is a SENSIBLE load (single-
+                // zone units): a coil rated on total capacity is sized duty / SHR.
+                let mut sensible_cooling_duty: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
 
                 for li in &loop_infos {
                     let (loop_flow, loop_heat, loop_cool) = match li.system_type {
@@ -1781,7 +1810,75 @@ fn main() -> Result<()> {
                                 })
                                 .sum::<f64>()
                                 * model.simulation.cooling_sizing_factor;
-                            (zone_flow_m3, zone_heat, zone_cool)
+
+                            // The coils also condition the unit's minimum
+                            // outdoor air and (cooling) absorb the fan heat;
+                            // neither is in the zone peaks.
+                            let oa_mass = if li.explicit_min_oa {
+                                li.min_oa_fraction * zone_airflow
+                            } else {
+                                let oa_m3: f64 = li
+                                    .served_zones
+                                    .iter()
+                                    .filter_map(|zn| env.zones.iter().find(|z| z.input.name == *zn))
+                                    .filter_map(|zone| {
+                                        zone.input.outdoor_air.as_ref().map(|oa| {
+                                            let people: f64 = zone
+                                                .input
+                                                .internal_gains
+                                                .iter()
+                                                .filter_map(|g| match g {
+                                                    openbse_envelope::InternalGainInput::People {
+                                                        count,
+                                                        ..
+                                                    } => Some(*count),
+                                                    _ => None,
+                                                })
+                                                .sum();
+                                            (oa.per_person * people
+                                                + oa.per_area * zone.input.floor_area)
+                                                * zone.input.zone_multiplier as f64
+                                        })
+                                    })
+                                    .sum();
+                                oa_m3 * air_density
+                            };
+                            let design_temp = |cooling: bool, fallback: f64| {
+                                let temps = model
+                                    .design_days
+                                    .iter()
+                                    .filter(|dd| {
+                                        let t = dd.day_type.to_lowercase();
+                                        if cooling {
+                                            t.contains("cool") || t.contains("summer")
+                                        } else {
+                                            t.contains("heat") || t.contains("winter")
+                                        }
+                                    })
+                                    .map(|dd| dd.design_temp);
+                                let t = if cooling {
+                                    temps.fold(f64::NEG_INFINITY, f64::max)
+                                } else {
+                                    temps.fold(f64::INFINITY, f64::min)
+                                };
+                                if t.is_finite() {
+                                    t
+                                } else {
+                                    fallback
+                                }
+                            };
+                            let (extra_heat, extra_cool) = single_zone_coil_extra_design_load(
+                                oa_mass,
+                                zone_airflow,
+                                li.supply_fan_dt,
+                                design_temp(false, -20.0),
+                                design_temp(true, 35.0),
+                            );
+                            (
+                                zone_flow_m3,
+                                zone_heat + extra_heat * model.simulation.heating_sizing_factor,
+                                zone_cool + extra_cool * model.simulation.cooling_sizing_factor,
+                            )
                         }
                         AirLoopSystemType::Vav | AirLoopSystemType::DualDuct => {
                             // VAV / DualDuct: multi-zone system, sized on the
@@ -2038,6 +2135,9 @@ fn main() -> Result<()> {
                     for comp_name in &li.component_names {
                         loop_comp_sizing
                             .insert(comp_name.clone(), (loop_flow, loop_heat, loop_cool));
+                        if li.system_type == AirLoopSystemType::PszAc {
+                            sensible_cooling_duty.insert(comp_name.clone());
+                        }
                     }
                 }
 
@@ -2082,6 +2182,12 @@ fn main() -> Result<()> {
                     if matches!(kind, ComponentKind::CoolingCoil | ComponentKind::EvapCooler) {
                         if let Some(cap) = comp.nominal_capacity() {
                             if is_autosize(cap) {
+                                let shr = if sensible_cooling_duty.contains(&name) {
+                                    comp.rated_sensible_heat_ratio().unwrap_or(1.0)
+                                } else {
+                                    1.0
+                                };
+                                let loop_cool = loop_cool / shr;
                                 comp.set_nominal_capacity(loop_cool);
                                 info!(
                                     "Autosized '{}' capacity: {:.0} W ({:.1} kW)",
@@ -6400,9 +6506,28 @@ fn simulate_all_loops(
                         } else {
                             let corrected_load = zone_heat_load.max(0.0);
 
+                            // Outdoor-air load of the off-cycle, the mirror of
+                            // the cooling case below: a fan that keeps running
+                            // keeps blowing mixed air into the zone while the
+                            // coil is off, so the coil must run long enough to
+                            // make that up as well:
+                            //   PLR = (L - Q_fan + Q_oa) / (Cap - Q_fan + Q_oa)
+                            // with Q_oa the heat needed to bring the outdoor
+                            // air to the zone. Left out, the unit settled the
+                            // zone about half a degree under setpoint all
+                            // winter (the load line then asked for just enough
+                            // extra to hold it there).
+                            let q_oa = -off_cycle_outdoor_air_load(
+                                li.fan_operating_mode,
+                                signals.oa_fraction.unwrap_or(effective_min_oa),
+                                supply_flow * cp_air,
+                                t_outdoor,
+                                control_temp,
+                            );
+
                             if corrected_load > 10.0 {
-                                let adj_load = (corrected_load - q_fan).max(0.0);
-                                let adj_cap = (q_capacity - q_fan).max(1.0);
+                                let adj_load = (corrected_load - q_fan + q_oa).max(0.0);
+                                let adj_cap = (q_capacity - q_fan + q_oa).max(1.0);
                                 (adj_load / adj_cap).clamp(plr_floor, 1.0)
                             } else {
                                 // Fallback: proportional zone error for transients
@@ -7468,6 +7593,21 @@ mod tests {
             1.25,
         );
         assert!((coincident - 12.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn single_zone_coils_carry_outdoor_air_and_fan_heat() {
+        // 0.1 kg/s of outdoor air on a 0.5 kg/s unit, 1 K fan rise,
+        // -20 C heating and 34 C cooling design temperatures.
+        let (heat, cool) = single_zone_coil_extra_design_load(0.1, 0.5, 1.0, -20.0, 34.0);
+        assert!((heat - 0.1 * 1005.0 * 41.0).abs() < 1e-6);
+        assert!((cool - (0.1 * 1005.0 * 10.0 + 0.5 * 1005.0)).abs() < 1e-6);
+        // No outdoor air, no fan rise: nothing beyond the zone's own load.
+        assert_eq!(single_zone_coil_extra_design_load(0.0, 0.5, 0.0, -20.0, 34.0), (0.0, 0.0));
+        // Outdoor air is never more than the supply, and mild design
+        // temperatures add no load of the wrong sign.
+        let (heat, cool) = single_zone_coil_extra_design_load(2.0, 0.5, 0.0, 25.0, 20.0);
+        assert_eq!((heat, cool), (0.0, 0.0));
     }
 
     #[test]
