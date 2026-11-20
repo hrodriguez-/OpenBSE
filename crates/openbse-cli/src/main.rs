@@ -6571,6 +6571,11 @@ fn simulate_all_loops(
                     if let Some(ep) = outputs.get_mut("electric_power") {
                         *ep *= power_factor;
                     }
+                    // A reversible unit's heating share (GSHP) is part of its
+                    // electric power, so it carries the same factor.
+                    if let Some(hp) = outputs.get_mut("heating_electric_power") {
+                        *hp *= power_factor;
+                    }
                     // DX electric split: compressor and condenser fan both carry
                     // the cycling penalty (scale by RTF); the indoor/supply fan
                     // uses PLR (handled via `electric_power` on the fan

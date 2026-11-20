@@ -700,6 +700,21 @@ pub fn build_psz_signals(li: &LoopInfo, ctx: &SignalCtx) -> ControlSignals {
     // (`single_zone_sat` is computed above, where it also aligns the OA mode.)
 
     for name in &li.component_names {
+        // Ground-source heat pump: one reversible component, so it has no
+        // heating or cooling role of its own. It derives its mode from its
+        // outlet setpoint against the inlet air, so drive that setpoint to the
+        // heating DAT, the cooling SAT, or the off sentinel per loop mode.
+        // Left alone it kept its 13 °C default and sat in cooling all winter.
+        if li.component_kinds.get(name) == Some(&ComponentKind::Gshp) {
+            let sp = match mode {
+                HvacMode::Heating => heating_dat,
+                HvacMode::Cooling => cooling_coil_sp,
+                HvacMode::Deadband => 99.0, // off sentinel (see gshp.rs)
+            };
+            signals.coil_setpoints.insert(name.clone(), sp);
+            signals.air_mass_flows.insert(name.clone(), flow);
+            continue;
+        }
         let role = li.coil_role(name);
         if single_zone_sat {
             match role {
@@ -2212,6 +2227,43 @@ mod tests {
             signals.coil_setpoints.get("DX Cooling Coil").copied(),
             Some(99.0)
         );
+    }
+
+    #[test]
+    fn psz_drives_a_gshp_by_loop_mode() {
+        // "GSHP-1" has neither "heat" nor "cool" in its name and one kind for
+        // both modes: it must follow the loop into heating, not sit in cooling.
+        let mut li = make_loop(AirLoopSystemType::PszAc, vec!["GSHP-1".to_string()]);
+        li.component_kinds
+            .insert("GSHP-1".to_string(), ComponentKind::Gshp);
+        let fixture = |temp: f64, cool: f64, heat: f64, mode: HvacMode| Fixture {
+            temps: one("Zone1", temp),
+            heat_sp: one("Zone1", 21.1),
+            cool_sp: one("Zone1", 23.9),
+            flows: one("Zone1", 0.5),
+            cool_loads: one("Zone1", cool),
+            heat_loads: one("Zone1", heat),
+            modes: [("Zone1".to_string(), mode)].into_iter().collect(),
+            empty: HashMap::new(),
+            returns: HashMap::new(),
+            mults: HashMap::new(),
+        };
+        let heating = fixture(18.0, 0.0, 2000.0, HvacMode::Heating);
+        let signals = build_psz_signals(&li, &heating.ctx(-5.0));
+        assert_eq!(
+            signals.coil_setpoints.get("GSHP-1").copied(),
+            Some(li.heating_supply_temp)
+        );
+        assert!(signals.air_mass_flows.contains_key("GSHP-1"));
+
+        let cooling = fixture(26.0, 2000.0, 0.0, HvacMode::Cooling);
+        let signals = build_psz_signals(&li, &cooling.ctx(32.0));
+        let sp = signals.coil_setpoints.get("GSHP-1").copied().unwrap();
+        assert!(sp < 20.0, "cooling setpoint {sp}");
+
+        let idle = fixture(22.5, 0.0, 0.0, HvacMode::Deadband);
+        let signals = build_psz_signals(&li, &idle.ctx(15.0));
+        assert_eq!(signals.coil_setpoints.get("GSHP-1").copied(), Some(99.0));
     }
 
     #[test]
