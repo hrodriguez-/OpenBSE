@@ -1859,10 +1859,12 @@ pub fn build_vav_signals(
 //
 // One fan feeds two parallel decks, each with its own coil; each zone's box
 // mixes the two at constant total flow (CAV). The signal builder:
-//   1. Finds the supply temperature each zone needs from its load:
-//      heating setpoint + load / (m·cp), or cooling setpoint - load / (m·cp).
-//      A zone with no load takes the unconditioned mixed air if that lies
-//      between its setpoints, else air at the nearer setpoint.
+//   1. Finds the supply temperatures that keep each zone between its
+//      setpoints: at least heating setpoint + load / (m·cp) for a zone with a
+//      heating load, at most cooling setpoint - load / (m·cp) for one with a
+//      cooling load, and never beyond the other setpoint. The zone gets the
+//      unconditioned mixed air when that lies in the range, else the nearer
+//      end of it.
 //   2. Runs a deck's coil only when some zone needs air warmer (hot deck) or
 //      cooler (cold deck) than the mixed air leaving the fan. An idle deck
 //      carries that mixed air.
@@ -1920,14 +1922,20 @@ pub fn build_dual_duct_signals(li: &mut LoopInfo, ctx: &SignalCtx) -> ControlSig
         let heat_load = zone_heating_loads.get(zone_name).copied().unwrap_or(0.0);
         let cool_load = zone_cooling_loads.get(zone_name).copied().unwrap_or(0.0);
         let m_cp = (box_flows.get(zone_name).copied().unwrap_or(0.5) * cp).max(1.0);
-        let target = if heat_load > 0.0 {
-            heat_sp + heat_load / m_cp
+        // Air between the setpoints cannot push a zone out of them, so the
+        // range is open to the other setpoint. Without that, a zone needing a
+        // little heat at its night setback called for the cold deck, because
+        // the mixed air was warmer than the temperature its load asked for.
+        let (lowest, highest) = if heat_load > 0.0 {
+            let needed = heat_sp + heat_load / m_cp;
+            (needed, needed.max(cool_sp))
         } else if cool_load > 0.0 {
-            cool_sp - cool_load / m_cp
+            let needed = cool_sp - cool_load / m_cp;
+            (needed.min(heat_sp), needed)
         } else {
-            deck_inlet.clamp(heat_sp.min(cool_sp), heat_sp.max(cool_sp))
+            (heat_sp.min(cool_sp), heat_sp.max(cool_sp))
         };
-        targets.push((zone_name.clone(), target));
+        targets.push((zone_name.clone(), deck_inlet.clamp(lowest, highest)));
 
         // RH override: an over-humid zone keeps the cold deck coil running.
         if let Some(&max_rh) = zone_max_rh.get(zone_name) {

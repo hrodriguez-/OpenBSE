@@ -2000,12 +2000,14 @@ fn main() -> Result<()> {
                                                 .input
                                                 .internal_gains
                                                 .iter()
-                                                .filter_map(|g| match g {
+                                                .filter_map(|g| {
+                                                    match g {
                                                     openbse_envelope::InternalGainInput::People {
                                                         count,
                                                         ..
                                                     } => Some(*count),
                                                     _ => None,
+                                                }
                                                 })
                                                 .sum();
                                             (oa.per_person * people
