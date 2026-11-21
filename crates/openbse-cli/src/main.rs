@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use openbse_airloop::{
     build_crac_signals, build_crah_signals, build_doas_signals, build_dual_duct_signals,
-    build_fcu_signals, build_psz_signals, build_vav_signals, hvac_mode, HvacMode, LoopInfo,
-    ZoneOaData,
+    build_fcu_signals, build_psz_signals, build_vav_signals, hvac_mode, CoilRole, HvacMode,
+    LoopInfo, ZoneOaData,
 };
 use openbse_core::graph::{GraphComponent, SimulationGraph};
 use openbse_core::ports::{
@@ -1958,7 +1958,83 @@ fn main() -> Result<()> {
                                 })
                                 .sum::<f64>()
                                 * model.simulation.cooling_sizing_factor;
-                            (zone_flow_m3, zone_heat, zone_cool)
+                            if li.system_type == AirLoopSystemType::DualDuct {
+                                // With every zone at its peak the hot deck
+                                // carries the zone loads plus the outdoor air
+                                // warmed to the zones, and the cold deck the
+                                // zone loads plus the outdoor air and the fan
+                                // heat. The zone peaks hold neither.
+                                let design_temp = |cooling: bool, fallback: f64| {
+                                    let temps = model
+                                        .design_days
+                                        .iter()
+                                        .filter(|dd| {
+                                            let t = dd.day_type.to_lowercase();
+                                            if cooling {
+                                                t.contains("cool") || t.contains("summer")
+                                            } else {
+                                                t.contains("heat") || t.contains("winter")
+                                            }
+                                        })
+                                        .map(|dd| dd.design_temp);
+                                    let t = if cooling {
+                                        temps.fold(f64::NEG_INFINITY, f64::max)
+                                    } else {
+                                        temps.fold(f64::INFINITY, f64::min)
+                                    };
+                                    if t.is_finite() {
+                                        t
+                                    } else {
+                                        fallback
+                                    }
+                                };
+                                // Outdoor air: the zones' requirement, as the
+                                // loop's fraction becomes after sizing.
+                                let required_oa: f64 = li
+                                    .served_zones
+                                    .iter()
+                                    .filter_map(|zn| env.zones.iter().find(|z| z.input.name == *zn))
+                                    .filter_map(|zone| {
+                                        zone.input.outdoor_air.as_ref().map(|oa| {
+                                            let people: f64 = zone
+                                                .input
+                                                .internal_gains
+                                                .iter()
+                                                .filter_map(|g| match g {
+                                                    openbse_envelope::InternalGainInput::People {
+                                                        count,
+                                                        ..
+                                                    } => Some(*count),
+                                                    _ => None,
+                                                })
+                                                .sum();
+                                            (oa.per_person * people
+                                                + oa.per_area * zone.input.floor_area)
+                                                * zone.input.zone_multiplier as f64
+                                        })
+                                    })
+                                    .sum::<f64>()
+                                    * air_density;
+                                let oa_mass = if li.explicit_min_oa || required_oa <= 0.0 {
+                                    li.min_oa_fraction * zone_airflow
+                                } else {
+                                    required_oa
+                                };
+                                let (extra_heat, extra_cool) = single_zone_coil_extra_design_load(
+                                    oa_mass,
+                                    zone_airflow,
+                                    li.supply_fan_dt,
+                                    design_temp(false, -20.0),
+                                    design_temp(true, 35.0),
+                                );
+                                (
+                                    zone_flow_m3,
+                                    zone_heat + extra_heat * model.simulation.heating_sizing_factor,
+                                    zone_cool + extra_cool * model.simulation.cooling_sizing_factor,
+                                )
+                            } else {
+                                (zone_flow_m3, zone_heat, zone_cool)
+                            }
                         }
                         AirLoopSystemType::Doas => {
                             // DOAS sizing: coils are sized to pre-condition 100% OA from
@@ -2195,7 +2271,9 @@ fn main() -> Result<()> {
                     for comp_name in &li.component_names {
                         loop_comp_sizing
                             .insert(comp_name.clone(), (loop_flow, loop_heat, loop_cool));
-                        if li.system_type == AirLoopSystemType::PszAc {
+                        if li.system_type == AirLoopSystemType::PszAc
+                            || li.system_type == AirLoopSystemType::DualDuct
+                        {
                             sensible_cooling_duty.insert(comp_name.clone());
                         }
                     }
@@ -7230,6 +7308,7 @@ fn simulate_all_loops(
                     }
                 } else {
                     // No terminal box — distribute AHU supply directly
+                    let mut zone_supply_w = effective_supply_w;
                     let (zone_flow, zone_supply_temp) = match li.system_type {
                         AirLoopSystemType::PszAc => {
                             let n = li.served_zones.len().max(1) as f64;
@@ -7250,18 +7329,42 @@ fn simulate_all_loops(
                             (flow, effective_supply_temp)
                         }
                         AirLoopSystemType::DualDuct => {
-                            // Dual-duct: per-zone blended supply temp from signal builder,
-                            // constant design_flow (CAV — no PLR scaling of flow).
+                            // Dual-duct: constant design_flow (CAV), blended
+                            // at the box's damper positions from the decks as
+                            // the coils actually left them, so a deck coil
+                            // short of its setpoint shows up in the zone.
                             let flow =
                                 signals.zone_air_flows.get(zone_name).copied().unwrap_or(
                                     effective_flow / li.served_zones.len().max(1) as f64,
                                 );
-                            let temp = signals
+                            let planned = signals
                                 .zone_supply_temps
                                 .get(zone_name)
                                 .copied()
                                 .unwrap_or(effective_supply_temp);
-                            (flow, temp)
+                            let deck = |role: CoilRole| {
+                                let name = li
+                                    .component_names
+                                    .iter()
+                                    .find(|n| li.coil_role(n.as_str()) == role)?;
+                                let out = all_outputs.get(name)?;
+                                Some((*out.get("outlet_temp")?, *out.get("outlet_w")?))
+                            };
+                            match (
+                                li.dd_boxes.get(zone_name),
+                                deck(CoilRole::Heating),
+                                deck(CoilRole::Cooling),
+                            ) {
+                                (Some(b), Some((t_hot, w_hot)), Some((t_cold, w_cold)))
+                                    if b.hot_flow + b.cold_flow > 0.0 =>
+                                {
+                                    let total = b.hot_flow + b.cold_flow;
+                                    zone_supply_w =
+                                        (b.hot_flow * w_hot + b.cold_flow * w_cold) / total;
+                                    (flow, (b.hot_flow * t_hot + b.cold_flow * t_cold) / total)
+                                }
+                                _ => (flow, planned),
+                            }
                         }
                         // CRAC / CRAH: recirculating, no OA mixing.
                         // Supply the full effective flow to the single served zone.
@@ -7273,7 +7376,7 @@ fn simulate_all_loops(
                     zone_supply.entry(zone_name.clone()).or_default().push((
                         zone_supply_temp,
                         zone_flow,
-                        effective_supply_w,
+                        zone_supply_w,
                     ));
                     if li.carries_return_air_heat() {
                         *zone_return_flows.entry(zone_name.clone()).or_default() += zone_flow;
@@ -7356,6 +7459,8 @@ fn simulate_loop_components(
     }
 
     let mut last_outlet: Option<AirPort> = None;
+    // Outlets by component, for components that branch from an earlier one.
+    let mut outlets: HashMap<&str, AirPort> = HashMap::new();
 
     for comp_name in component_names {
         // Get node index for this component
@@ -7381,8 +7486,12 @@ fn simulate_loop_components(
                     component.set_ambient_temp(amb_temp);
                 }
 
-                // Use previous component's outlet as inlet; first component uses loop inlet
-                let mut this_inlet = last_outlet.unwrap_or(inlet_air);
+                // Use previous component's outlet as inlet; first component uses loop inlet.
+                // A parallel branch takes the outlet of the component it branches from.
+                let mut this_inlet = match signals.branch_inlets.get(comp_name.as_str()) {
+                    Some(from) => outlets.get(from.as_str()).copied().unwrap_or(inlet_air),
+                    None => last_outlet.unwrap_or(inlet_air),
+                };
 
                 // Apply mass flow override if set
                 if let Some(&flow) = signals.air_mass_flows.get(comp_name.as_str()) {
@@ -7411,6 +7520,7 @@ fn simulate_loop_components(
                 });
                 outputs.insert(comp_name.clone(), comp_outputs);
 
+                outlets.insert(comp_name.as_str(), outlet);
                 last_outlet = Some(outlet);
             }
             GraphComponent::Plant(_) => {

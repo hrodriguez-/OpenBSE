@@ -122,9 +122,35 @@ impl DualDuctBox {
         (self.supply_temp, self.design_flow)
     }
 
+    /// Set the dampers to deliver `target` [°C] from the two decks at the
+    /// box's constant flow, as E+ `AirTerminal:DualDuct:ConstantVolume` does
+    /// from the zone load. A target outside the decks' range gets the nearer
+    /// deck alone; decks at the same temperature split evenly.
+    ///
+    /// Returns `(supply_temp, total_mass_flow)`.
+    pub fn blend_to(&mut self, target: f64, hot_deck_temp: f64, cold_deck_temp: f64) -> (f64, f64) {
+        let hot_fraction = hot_deck_fraction(target, hot_deck_temp, cold_deck_temp);
+        self.hot_flow = self.design_flow * hot_fraction;
+        self.cold_flow = self.design_flow - self.hot_flow;
+        self.supply_temp = hot_fraction * hot_deck_temp + (1.0 - hot_fraction) * cold_deck_temp;
+        self.supply_mass_flow = self.design_flow;
+        (self.supply_temp, self.design_flow)
+    }
+
     /// Component classification for energy accounting.
     pub fn component_kind(&self) -> ComponentKind {
         ComponentKind::DualDuctBox
+    }
+}
+
+/// Fraction of a mixing box's flow drawn from the hot deck to deliver
+/// `target` [°C], in [0, 1]. 0.5 when the decks are at the same temperature.
+pub fn hot_deck_fraction(target: f64, hot_deck_temp: f64, cold_deck_temp: f64) -> f64 {
+    let span = hot_deck_temp - cold_deck_temp;
+    if span.abs() < 1.0e-6 {
+        0.5
+    } else {
+        ((target - cold_deck_temp) / span).clamp(0.0, 1.0)
     }
 }
 
@@ -140,6 +166,35 @@ mod tests {
 
     fn make_box() -> DualDuctBox {
         DualDuctBox::new("test-box", FLOW, MIN_FRAC)
+    }
+
+    #[test]
+    fn blend_to_delivers_the_target_between_the_decks() {
+        let mut b = make_box();
+        // A zone needing slight cooling gets air just under its temperature,
+        // not the mostly-hot blend the damper minimum used to give.
+        let (supply_temp, total_flow) = b.blend_to(22.0, HOT, COLD);
+        assert!((supply_temp - 22.0).abs() < TOL, "supply {supply_temp}");
+        assert!((total_flow - FLOW).abs() < TOL);
+        assert!((b.hot_flow + b.cold_flow - FLOW).abs() < TOL);
+        assert!((b.hot_flow / FLOW - (22.0 - COLD) / (HOT - COLD)).abs() < TOL);
+    }
+
+    #[test]
+    fn blend_to_clamps_to_the_nearer_deck() {
+        let mut b = make_box();
+        let (hot, _) = b.blend_to(45.0, HOT, COLD);
+        assert!((hot - HOT).abs() < TOL && b.cold_flow.abs() < TOL);
+        let (cold, _) = b.blend_to(5.0, HOT, COLD);
+        assert!((cold - COLD).abs() < TOL && b.hot_flow.abs() < TOL);
+    }
+
+    #[test]
+    fn blend_to_with_equal_decks_splits_evenly() {
+        let mut b = make_box();
+        let (supply_temp, _) = b.blend_to(30.0, 23.0, 23.0);
+        assert!((supply_temp - 23.0).abs() < TOL);
+        assert!((b.hot_flow - FLOW / 2.0).abs() < TOL);
     }
 
     #[test]

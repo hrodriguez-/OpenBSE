@@ -1857,20 +1857,24 @@ pub fn build_vav_signals(
 
 // ─── Dual-Duct Signal Builder ────────────────────────────────────────────────
 //
-// Each zone has a mixing box with two dampers (hot and cold deck).
-// The box blends hot and cold supply air at constant total flow (CAV).
-// The signal builder:
-//   1. Determines zone mode (Heating / Cooling / Deadband) from predictor temps.
-//   2. Computes zone PLR from the zone's estimated load.
-//   3. Calls DualDuctBox::simulate() to get blended supply temp and flow.
-//   4. Stores per-zone supply temps in signals.zone_supply_temps and
-//      per-zone flows in signals.zone_air_flows.
-//   5. Sets AHU coil setpoints:
-//      - Hot deck coil: target = heating_supply_temp when any zone needs heat
-//      - Cold deck coil: target = cooling_supply_temp when any zone needs cool
-//      - Fan: receives total design flow (Σ zone design_flows)
+// One fan feeds two parallel decks, each with its own coil; each zone's box
+// mixes the two at constant total flow (CAV). The signal builder:
+//   1. Finds the supply temperature each zone needs from its load:
+//      heating setpoint + load / (m·cp), or cooling setpoint - load / (m·cp).
+//      A zone with no load takes the unconditioned mixed air if that lies
+//      between its setpoints, else air at the nearer setpoint.
+//   2. Runs a deck's coil only when some zone needs air warmer (hot deck) or
+//      cooler (cold deck) than the mixed air leaving the fan. An idle deck
+//      carries that mixed air.
+//   3. Sets each box's dampers to blend the two decks to the zone's
+//      temperature (E+ AirTerminal:DualDuct:ConstantVolume), and sends each
+//      deck coil only its own deck's share of the airflow.
+//
+// The boxes used to open from a damper minimum with the load: a zone needing
+// a little cooling got 80% hot-deck air (33 °C), which held it above its
+// cooling setpoint all year. And the two coils sat in series on the whole
+// airflow, the cold deck re-cooling everything the hot deck had heated.
 pub fn build_dual_duct_signals(li: &mut LoopInfo, ctx: &SignalCtx) -> ControlSignals {
-    let zone_temps = ctx.zone_temps;
     let zone_heat_sp = ctx.zone_heat_sp;
     let zone_cool_sp = ctx.zone_cool_sp;
     let zone_design_flows = ctx.zone_design_flows;
@@ -1878,142 +1882,154 @@ pub fn build_dual_duct_signals(li: &mut LoopInfo, ctx: &SignalCtx) -> ControlSig
     let effective_min_oa = ctx.effective_min_oa;
     let zone_cooling_loads = ctx.zone_cooling_loads;
     let zone_heating_loads = ctx.zone_heating_loads;
+    let zone_temps = ctx.zone_temps;
     let zone_humidity_ratios = ctx.zone_humidity_ratios;
     let zone_max_rh = ctx.zone_max_rh;
     let zone_min_rh = ctx.zone_min_rh;
 
     let mut signals = ControlSignals::default();
     let cp = 1005.0_f64;
-    let hot_deck_temp = li.heating_supply_temp;
-    let cold_deck_temp = li.cooling_supply_temp;
 
-    let mut total_flow = 0.0_f64;
-    let mut any_heating = false;
-    let mut any_cooling = false;
+    // Box flows are constant, so the return mix and the air reaching the
+    // decks are known before any damper is set.
+    let box_flows: HashMap<String, f64> = li
+        .served_zones
+        .iter()
+        .map(|z| {
+            let flow = li
+                .dd_boxes
+                .get(z)
+                .map(|b| b.design_flow)
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .unwrap_or_else(|| zone_design_flows.get(z).copied().unwrap_or(0.5));
+            (z.clone(), flow)
+        })
+        .collect();
+    let return_air_temp = mixed_return_temp(ctx, &li.served_zones, |z| {
+        box_flows.get(z).copied().unwrap_or(0.0)
+    });
+    let mixed_air_temp = return_air_temp * (1.0 - effective_min_oa) + t_outdoor * effective_min_oa;
+    let deck_inlet = mixed_air_temp + li.supply_fan_dt.max(0.0);
 
+    // Supply temperature each zone needs.
+    let mut dehumidify = false;
+    let mut targets: Vec<(String, f64)> = Vec::with_capacity(li.served_zones.len());
     for zone_name in &li.served_zones {
-        let zone_temp = zone_temps.get(zone_name).copied().unwrap_or(21.0);
         let heat_sp = zone_heat_sp.get(zone_name).copied().unwrap_or(21.1);
         let cool_sp = zone_cool_sp.get(zone_name).copied().unwrap_or(23.9);
         let heat_load = zone_heating_loads.get(zone_name).copied().unwrap_or(0.0);
         let cool_load = zone_cooling_loads.get(zone_name).copied().unwrap_or(0.0);
-
-        // Still the in-iteration temperature: deadband mixes the two decks
-        // 50/50 at design flow, so the predictor's mode moves results far
-        // more than the few timesteps that don't converge (#170).
-        let mode = hvac_mode(zone_temp, heat_sp, cool_sp);
-
-        // RH override: if zone is over-humid and in deadband, force cooling
-        let zone_w = zone_humidity_ratios
-            .get(zone_name)
-            .copied()
-            .unwrap_or(0.008);
-        let zone_rh = openbse_psychrometrics::rh_fn_tdb_w_pb(zone_temp, zone_w, 101325.0) * 100.0;
-        let mode = if let Some(&max_rh) = zone_max_rh.get(zone_name) {
-            if zone_rh > max_rh && mode == HvacMode::Deadband {
-                HvacMode::Cooling
-            } else {
-                mode
-            }
+        let m_cp = (box_flows.get(zone_name).copied().unwrap_or(0.5) * cp).max(1.0);
+        let target = if heat_load > 0.0 {
+            heat_sp + heat_load / m_cp
+        } else if cool_load > 0.0 {
+            cool_sp - cool_load / m_cp
         } else {
-            mode
+            deck_inlet.clamp(heat_sp.min(cool_sp), heat_sp.max(cool_sp))
         };
+        targets.push((zone_name.clone(), target));
 
-        let heating = mode == HvacMode::Heating;
-        let cooling = mode == HvacMode::Cooling;
-        if heating {
-            any_heating = true;
-        }
-        if cooling {
-            any_cooling = true;
-        }
-
-        // PLR: fraction of available ΔT used
-        let plr = match mode {
-            HvacMode::Heating if heat_load > 0.0 => {
-                // Estimate PLR from load vs. max capacity at design flow
-                let design_flow = zone_design_flows.get(zone_name).copied().unwrap_or(
-                    li.dd_boxes
-                        .get(zone_name)
-                        .map(|b| b.design_flow)
-                        .unwrap_or(0.5),
-                );
-                let q_max = design_flow * cp * (hot_deck_temp - heat_sp).max(1.0);
-                (heat_load / q_max).clamp(0.0, 1.0)
+        // RH override: an over-humid zone keeps the cold deck coil running.
+        if let Some(&max_rh) = zone_max_rh.get(zone_name) {
+            let zone_temp = zone_temps.get(zone_name).copied().unwrap_or(21.0);
+            let zone_w = zone_humidity_ratios
+                .get(zone_name)
+                .copied()
+                .unwrap_or(0.008);
+            let zone_rh =
+                openbse_psychrometrics::rh_fn_tdb_w_pb(zone_temp, zone_w, 101325.0) * 100.0;
+            if zone_rh > max_rh {
+                dehumidify = true;
             }
-            HvacMode::Cooling if cool_load > 0.0 => {
-                let design_flow = zone_design_flows.get(zone_name).copied().unwrap_or(
-                    li.dd_boxes
-                        .get(zone_name)
-                        .map(|b| b.design_flow)
-                        .unwrap_or(0.5),
-                );
-                let q_max = design_flow * cp * (cool_sp - cold_deck_temp).max(1.0);
-                (cool_load / q_max).clamp(0.0, 1.0)
-            }
-            _ => 0.0,
-        };
+        }
+    }
 
-        // Get or create a DualDuctBox for this zone.
-        // If not already in li.dd_boxes, use design_flow from zone_design_flows.
-        let (supply_temp, zone_flow) = if let Some(dd_box) = li.dd_boxes.get_mut(zone_name) {
-            dd_box.simulate(heating, cooling, plr, hot_deck_temp, cold_deck_temp)
+    // A deck coil runs only when some zone needs air beyond the mixed air.
+    let hot_on = targets.iter().any(|(_, t)| *t > deck_inlet + 0.01);
+    let cold_on = dehumidify || targets.iter().any(|(_, t)| *t < deck_inlet - 0.01);
+    let hot_deck_temp = if hot_on {
+        li.heating_supply_temp.max(deck_inlet)
+    } else {
+        deck_inlet
+    };
+    let cold_deck_temp = if cold_on {
+        li.cooling_supply_temp.min(deck_inlet)
+    } else {
+        deck_inlet
+    };
+
+    let (mut total_flow, mut hot_total, mut cold_total) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for (zone_name, target) in &targets {
+        let flow = box_flows.get(zone_name).copied().unwrap_or(0.5);
+        let sized_box = li
+            .dd_boxes
+            .get_mut(zone_name)
+            .filter(|b| b.design_flow.is_finite() && b.design_flow > 0.0);
+        let (supply_temp, hot_flow) = if let Some(dd_box) = sized_box {
+            let (supply_temp, _) = dd_box.blend_to(*target, hot_deck_temp, cold_deck_temp);
+            (supply_temp, dd_box.hot_flow)
         } else {
-            // No box registered (e.g., during warmup before autosizing)
-            let fallback_flow = zone_design_flows.get(zone_name).copied().unwrap_or(0.5);
-            let min_flow = fallback_flow * 0.20;
-            let (hot_flow, cold_flow) = if heating {
-                let hf = min_flow + plr * (fallback_flow - min_flow);
-                (hf, fallback_flow - hf)
-            } else if cooling {
-                let cf = min_flow + plr * (fallback_flow - min_flow);
-                (fallback_flow - cf, cf)
-            } else {
-                (fallback_flow / 2.0, fallback_flow / 2.0)
-            };
-            let blended = (hot_flow * hot_deck_temp + cold_flow * cold_deck_temp) / fallback_flow;
-            (blended, fallback_flow)
+            // No sized box yet (before autosizing): the same blend at the
+            // zone's design flow.
+            let hot_fraction = openbse_components::dual_duct_box::hot_deck_fraction(
+                *target,
+                hot_deck_temp,
+                cold_deck_temp,
+            );
+            (
+                hot_fraction * hot_deck_temp + (1.0 - hot_fraction) * cold_deck_temp,
+                flow * hot_fraction,
+            )
         };
 
         signals
             .zone_supply_temps
             .insert(zone_name.clone(), supply_temp);
-        signals.zone_air_flows.insert(zone_name.clone(), zone_flow);
+        signals.zone_air_flows.insert(zone_name.clone(), flow);
         let zmult = ctx.zone_multipliers.get(zone_name).copied().unwrap_or(1) as f64;
-        total_flow += zone_flow * zmult;
+        total_flow += flow * zmult;
+        hot_total += hot_flow * zmult;
+        cold_total += (flow - hot_flow) * zmult;
     }
     total_flow = total_flow.max(0.05);
 
-    // ── AHU coil setpoints ──
-    // Hot deck: target heating_supply_temp when any zone in heating mode
-    // Cold deck: target cooling_supply_temp when any zone in cooling mode
-    // Both operate simultaneously — each deck heats/cools its own portion of air
+    // ── Deck coils ──
+    // Each coil conditions its own deck's air, drawn from the same point: the
+    // component ahead of the first deck coil (the fan in a blow-through unit),
+    // or the loop inlet when a coil comes first.
+    let mut split_point: Option<String> = None;
+    let mut previous: Option<&String> = None;
+    let mut seen_deck_coil = false;
     for name in &li.component_names {
         let role = li.coil_role(name);
-        if role == CoilRole::Cooling {
-            // Cold deck coil
-            if any_cooling {
-                signals.coil_setpoints.insert(name.clone(), cold_deck_temp);
+        let deck = match role {
+            CoilRole::Cooling => Some((cold_on, cold_deck_temp, 99.0, cold_total)),
+            CoilRole::Heating => Some((hot_on, hot_deck_temp, -99.0, hot_total)),
+            _ => None,
+        };
+        if let Some((on, deck_temp, off, deck_flow)) = deck {
+            signals
+                .coil_setpoints
+                .insert(name.clone(), if on { deck_temp } else { off });
+            signals
+                .air_mass_flows
+                .insert(name.clone(), deck_flow.max(1.0e-4));
+            if seen_deck_coil {
+                signals
+                    .branch_inlets
+                    .insert(name.clone(), split_point.clone().unwrap_or_default());
             } else {
-                signals.coil_setpoints.insert(name.clone(), 99.0);
+                split_point = previous.cloned();
+                seen_deck_coil = true;
             }
-        } else if role == CoilRole::Heating {
-            // Hot deck coil
-            if any_heating {
-                signals.coil_setpoints.insert(name.clone(), hot_deck_temp);
-            } else {
-                signals.coil_setpoints.insert(name.clone(), -99.0);
-            }
+        } else {
+            signals.air_mass_flows.insert(name.clone(), total_flow);
         }
-        signals.air_mass_flows.insert(name.clone(), total_flow);
+        previous = Some(name);
     }
 
-    // Mixed air for AHU inlet: blend outdoor and return air at min_oa_fraction.
+    // Mixed air for AHU inlet: outdoor and return air at min_oa_fraction.
     // The return is the zones' outlets mixed at the box flows (#51).
-    let return_air_temp = mixed_return_temp(ctx, &li.served_zones, |z| {
-        signals.zone_air_flows.get(z).copied().unwrap_or(0.0)
-    });
-    let mixed_air_temp = return_air_temp * (1.0 - effective_min_oa) + t_outdoor * effective_min_oa;
     signals.return_air_temp = Some(return_air_temp);
     signals.mixed_air_temp = Some(mixed_air_temp);
     signals.oa_fraction = Some(effective_min_oa);

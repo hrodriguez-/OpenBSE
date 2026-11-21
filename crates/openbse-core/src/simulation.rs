@@ -82,6 +82,11 @@ pub struct ControlSignals {
     pub zone_supply_temps: HashMap<String, f64>,
     /// Zone air flows: zone_name -> mass_flow [kg/s]
     pub zone_air_flows: HashMap<String, f64>,
+    /// Parallel branches: component_name -> the upstream component whose
+    /// outlet it takes as its inlet, in place of the component before it in
+    /// the chain ("" = the loop inlet). A dual-duct loop's second deck coil
+    /// branches from the same air as the first.
+    pub branch_inlets: HashMap<String, String>,
     /// SAT setpoint from the VAV signal builder [°C] (0 when unset); the
     /// mixed-air target that heat recovery is throttled to.
     pub sat_setpoint: f64,
