@@ -321,6 +321,25 @@ fn single_zone_coil_extra_design_load(
     (heat, cool)
 }
 
+/// Airflow [m³/s] a VRF indoor unit needs to deliver its capacities as
+/// sensible heat at its supply temperatures, into a zone at the usual design
+/// setpoints (24 °C cooling, 21 °C heating).
+///
+/// The unit's output is capped by what its airflow can carry. The old rule,
+/// 0.00005 m³/s per W, carried only two thirds of the cooling capacity at a
+/// 13 °C supply, so an autosized unit ran flat out and still fell short.
+fn vrf_design_airflow(
+    cooling_capacity: f64,
+    heating_capacity: f64,
+    cooling_supply_temp: f64,
+    heating_supply_temp: f64,
+) -> f64 {
+    let rho_cp = 1.2 * 1005.0;
+    let cooling = cooling_capacity.max(0.0) / (rho_cp * (24.0 - cooling_supply_temp).max(1.0));
+    let heating = heating_capacity.max(0.0) / (rho_cp * (heating_supply_temp - 21.0).max(1.0));
+    cooling.max(heating)
+}
+
 /// Signed load to the cooling setpoint [W], positive when the zone needs
 /// cooling to stay at it, from the signed load to the heating setpoint and
 /// the load line's slope [W/K] (the load is linear in the target
@@ -1661,6 +1680,9 @@ fn main() -> Result<()> {
         // Zone peak loads for VRF autosizing (populated during sizing, used after)
         let mut vrf_zone_peak_heating: HashMap<String, f64> = HashMap::new();
         let mut vrf_zone_peak_cooling: HashMap<String, f64> = HashMap::new();
+        // Design load of the outdoor air that reaches a zone directly [W]:
+        // (heating, cooling). The zone peaks leave it out.
+        let mut vrf_zone_oa_load: HashMap<String, (f64, f64)> = HashMap::new();
         if !model.design_days.is_empty() {
             if let Some(ref mut env) = envelope {
                 let latitude = weather_data.location.latitude;
@@ -1707,6 +1729,68 @@ fn main() -> Result<()> {
                 // Store zone peaks for VRF autosizing
                 vrf_zone_peak_heating = sizing_result.zone_peak_heating.clone();
                 vrf_zone_peak_cooling = sizing_result.zone_peak_cooling.clone();
+                // Outdoor air no air loop brings enters the zone directly at
+                // outdoor temperature all year, but sizing leaves it out of
+                // the zone peaks. A VRF unit is the only thing that can meet
+                // it, so its capacity carries it.
+                {
+                    let loop_oa_zones: HashSet<&String> = loop_infos
+                        .iter()
+                        .filter(|li| li.min_oa_fraction > 0.001)
+                        .flat_map(|li| li.served_zones.iter())
+                        .collect();
+                    let design_temp = |cooling: bool, fallback: f64| {
+                        let temps = model
+                            .design_days
+                            .iter()
+                            .filter(|dd| {
+                                let t = dd.day_type.to_lowercase();
+                                if cooling {
+                                    t.contains("cool") || t.contains("summer")
+                                } else {
+                                    t.contains("heat") || t.contains("winter")
+                                }
+                            })
+                            .map(|dd| dd.design_temp);
+                        let t = if cooling {
+                            temps.fold(f64::NEG_INFINITY, f64::max)
+                        } else {
+                            temps.fold(f64::INFINITY, f64::min)
+                        };
+                        if t.is_finite() {
+                            t
+                        } else {
+                            fallback
+                        }
+                    };
+                    let (t_heat, t_cool) = (design_temp(false, -20.0), design_temp(true, 35.0));
+                    for zone in env.zones.iter() {
+                        if loop_oa_zones.contains(&zone.input.name) {
+                            continue;
+                        }
+                        if let Some(oa) = zone.input.outdoor_air.as_ref() {
+                            let people: f64 = zone
+                                .input
+                                .internal_gains
+                                .iter()
+                                .filter_map(|g| match g {
+                                    openbse_envelope::InternalGainInput::People {
+                                        count, ..
+                                    } => Some(*count),
+                                    _ => None,
+                                })
+                                .sum();
+                            let oa_mass =
+                                (oa.per_person * people + oa.per_area * zone.input.floor_area) * 1.2;
+                            vrf_zone_oa_load.insert(
+                                zone.input.name.clone(),
+                                single_zone_coil_extra_design_load(
+                                    oa_mass, oa_mass, 0.0, t_heat, t_cool,
+                                ),
+                            );
+                        }
+                    }
+                }
 
                 // Apply sized zone airflows (override design_zone_flow).
                 // For VAV zones, apply the cooling sizing factor to compensate
@@ -2671,6 +2755,18 @@ fn main() -> Result<()> {
 
         // ── 6b. Build VRF systems ──────────────────────────────────────────────
         use openbse_components::vrf::{VrfIndoorUnit, VrfOutdoorUnit};
+        // Autosized indoor-unit capacities [W]: the zone peak plus the outdoor
+        // air that reaches the zone directly, times the sizing factor.
+        let vrf_design_cooling = |zone: &str| {
+            (vrf_zone_peak_cooling.get(zone).copied().unwrap_or(3000.0)
+                + vrf_zone_oa_load.get(zone).map(|l| l.1).unwrap_or(0.0))
+                * model.simulation.cooling_sizing_factor
+        };
+        let vrf_design_heating = |zone: &str| {
+            (vrf_zone_peak_heating.get(zone).copied().unwrap_or(3000.0)
+                + vrf_zone_oa_load.get(zone).map(|l| l.0).unwrap_or(0.0))
+                * model.simulation.heating_sizing_factor
+        };
         let mut vrf_systems: Vec<(VrfOutdoorUnit, Vec<VrfIndoorUnit>)> = model
             .vrf_systems
             .iter()
@@ -2683,11 +2779,7 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|iu| {
                         if iu.cooling_capacity.is_autosize() {
-                            vrf_zone_peak_cooling
-                                .get(&iu.zone)
-                                .copied()
-                                .unwrap_or(3000.0)
-                                * model.simulation.cooling_sizing_factor
+                            vrf_design_cooling(iu.zone.as_str())
                         } else {
                             iu.cooling_capacity.to_f64()
                         }
@@ -2698,11 +2790,7 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|iu| {
                         if iu.heating_capacity.is_autosize() {
-                            vrf_zone_peak_heating
-                                .get(&iu.zone)
-                                .copied()
-                                .unwrap_or(3000.0)
-                                * model.simulation.heating_sizing_factor
+                            vrf_design_heating(iu.zone.as_str())
                         } else {
                             iu.heating_capacity.to_f64()
                         }
@@ -2745,35 +2833,27 @@ fn main() -> Result<()> {
                 odu.heating_cap_ft = resolve_curve(&ou_in.heating_cap_ft);
                 odu.heating_eir_ft = resolve_curve(&ou_in.heating_eir_ft);
 
-                // Airflow for autosized indoor units: 0.00005 m³/s per W of capacity
-                let airflow_per_watt = 0.00005_f64;
-
                 let indoor_units: Vec<VrfIndoorUnit> = sys
                     .indoor_units
                     .iter()
                     .map(|iu_in| {
                         let cool_cap = if iu_in.cooling_capacity.is_autosize() {
-                            (vrf_zone_peak_cooling
-                                .get(&iu_in.zone)
-                                .copied()
-                                .unwrap_or(3000.0)
-                                * model.simulation.cooling_sizing_factor)
-                                .max(500.0)
+                            vrf_design_cooling(iu_in.zone.as_str()).max(500.0)
                         } else {
                             iu_in.cooling_capacity.to_f64()
                         };
                         let heat_cap = if iu_in.heating_capacity.is_autosize() {
-                            (vrf_zone_peak_heating
-                                .get(&iu_in.zone)
-                                .copied()
-                                .unwrap_or(3000.0)
-                                * model.simulation.heating_sizing_factor)
-                                .max(500.0)
+                            vrf_design_heating(iu_in.zone.as_str()).max(500.0)
                         } else {
                             iu_in.heating_capacity.to_f64()
                         };
                         let airflow = if iu_in.rated_airflow.is_autosize() {
-                            cool_cap.max(heat_cap) * airflow_per_watt
+                            vrf_design_airflow(
+                                cool_cap,
+                                heat_cap,
+                                iu_in.cooling_supply_temp,
+                                iu_in.heating_supply_temp,
+                            )
                         } else {
                             iu_in.rated_airflow.to_f64()
                         };
@@ -7828,6 +7908,19 @@ fn month_day_from_hour(hour_of_year: u32, dims: &[u32; 12]) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vrf_airflow_carries_the_capacity_at_the_supply_temperature() {
+        let rho_cp = 1.2 * 1005.0;
+        // Cooling governs: 5 kW at 13 °C into a 24 °C zone.
+        let flow = vrf_design_airflow(5000.0, 3000.0, 13.0, 38.0);
+        assert!((flow * rho_cp * 11.0 - 5000.0).abs() < 1e-6);
+        // The old rule gave 0.25 m³/s, which carries only 3.3 kW.
+        assert!(flow > 5000.0 * 0.00005);
+        // Heating governs with a cool heating supply.
+        let flow = vrf_design_airflow(1000.0, 4000.0, 13.0, 30.0);
+        assert!((flow * rho_cp * 9.0 - 4000.0).abs() < 1e-6);
+    }
 
     #[test]
     fn multizone_design_flow_sums_zones_at_their_own_or_a_shared_peak() {

@@ -204,13 +204,16 @@ impl VrfOutdoorUnit {
         zone_loads: &HashMap<String, f64>,
         outdoor_humidity_ratio: f64,
     ) {
-        let air_density = psych::rho_air_fn_pb_tdb_w(101325.0, t_outdoor, outdoor_humidity_ratio);
         let cp_air = psych::cp_air_fn_w(outdoor_humidity_ratio);
 
         // ── Step 1: Mode and PLR for each indoor unit from its zone's load ─
         for iu in indoor_units.iter_mut() {
             let t_zone = zone_temps.get(&iu.zone).copied().unwrap_or(21.0);
             let load = zone_loads.get(&iu.zone).copied().unwrap_or(0.0);
+            // Room air passes the indoor unit, so its density is the zone's;
+            // at the outdoor temperature a summer peak lost 6% of the airflow.
+            let air_density =
+                psych::rho_air_fn_pb_tdb_w(101325.0, t_zone, outdoor_humidity_ratio);
             // The most the unit's rated airflow can carry at its supply temperature.
             let air_limit = |t_supply: f64| {
                 (iu.rated_airflow * air_density * cp_air * (t_supply - t_zone).abs()).max(0.0)
