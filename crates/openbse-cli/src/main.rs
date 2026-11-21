@@ -321,6 +321,19 @@ fn single_zone_coil_extra_design_load(
     (heat, cool)
 }
 
+/// Heat [W] a unit's fan-only air delivers to a zone held at `t_zone`: the
+/// supply flow, mixed with its outdoor-air fraction and warmed by the fan,
+/// against the room. Negative when cold outdoor air outweighs the fan heat.
+fn fan_only_heat_to_zone(
+    supply_mass_flow: f64,
+    oa_fraction: f64,
+    t_outdoor: f64,
+    t_zone: f64,
+    fan_dt: f64,
+) -> f64 {
+    supply_mass_flow * 1006.0 * (oa_fraction * (t_outdoor - t_zone) + fan_dt)
+}
+
 /// Supply flow [kg/s] of a single-zone VAV unit: the flow that meets the
 /// zone's cooling load [W] with the supply at its coldest, `cooling_dt` below
 /// the setpoint, bounded by the minimum fraction and the design flow. With no
@@ -1827,12 +1840,14 @@ fn main() -> Result<()> {
                                                 .input
                                                 .internal_gains
                                                 .iter()
-                                                .filter_map(|g| match g {
+                                                .filter_map(|g| {
+                                                    match g {
                                                     openbse_envelope::InternalGainInput::People {
                                                         count,
                                                         ..
                                                     } => Some(*count),
                                                     _ => None,
+                                                }
                                                 })
                                                 .sum();
                                             (oa.per_person * people
@@ -6068,7 +6083,7 @@ fn simulate_all_loops(
         // For each served zone, compute a predictor mode and store it.
         // PTAC/FCU (single-zone) use the single zone's mode.
         // PSZ-AC uses the control zone's mode.
-        let predictor_modes: HashMap<String, HvacMode> = li
+        let mut predictor_modes: HashMap<String, HvacMode> = li
             .served_zones
             .iter()
             .map(|z| {
@@ -6103,6 +6118,35 @@ fn simulate_all_loops(
                 (z.clone(), mode)
             })
             .collect();
+
+        // A single-zone unit whose fan runs through the coil's off-cycle keeps
+        // blowing mixed air into its zone. The predictor's loads leave the
+        // loop's outdoor air out (the loop conditions it), so a zone whose own
+        // gains hold it above the heating setpoint reads "no load" while the
+        // fan-only air, colder than the room in winter, takes it below. The
+        // unit then heats only after the zone has already dropped, and bounces.
+        // Heat whenever the load to setpoint exceeds what the fan-only air
+        // delivers (EnergyPlus compares the load with the unit's no-load
+        // output the same way).
+        if li.system_type == AirLoopSystemType::PszAc
+            && li.fan_operating_mode == openbse_io::input::FanOperatingMode::Continuous
+        {
+            if let Some(zname) = li.served_zones.first() {
+                let heat_sp = active_heat_sp.get(zname).copied().unwrap_or(21.1);
+                let flow = zone_design_flows.get(zname).copied().unwrap_or(0.0);
+                let to_heat = zone_loads_to_heating_sp.get(zname).copied().unwrap_or(0.0);
+                let fan_only = fan_only_heat_to_zone(
+                    flow,
+                    effective_min_oa,
+                    t_outdoor,
+                    heat_sp,
+                    li.supply_fan_dt,
+                );
+                if to_heat - fan_only > 10.0 {
+                    predictor_modes.insert(zname.clone(), HvacMode::Heating);
+                }
+            }
+        }
 
         // Supply flow of a single-zone VAV loop, set by its SingleZone reset.
         let mut single_zone_vav_flow: Option<f64> = None;
@@ -6525,8 +6569,30 @@ fn simulate_all_loops(
                                 control_temp,
                             );
 
-                            if corrected_load > 10.0 {
-                                let adj_load = (corrected_load - q_fan + q_oa).max(0.0);
+                            // With the fan running through the off-cycle the
+                            // coil's duty is the SIGNED load to setpoint less
+                            // what the fan-only air delivers, and that can be
+                            // a heating duty while the zone's own load is nil.
+                            let continuous_duty = if li.fan_operating_mode
+                                == openbse_io::input::FanOperatingMode::Continuous
+                            {
+                                let signed_load = zone_loads_to_heating_sp
+                                    .get(control_zone)
+                                    .copied()
+                                    .unwrap_or(zone_heat_load)
+                                    * zmult_plr;
+                                signed_load - q_fan + q_oa
+                            } else {
+                                0.0
+                            };
+
+                            if corrected_load > 10.0 || continuous_duty > 10.0 {
+                                let duty = if corrected_load > 10.0 {
+                                    corrected_load - q_fan + q_oa
+                                } else {
+                                    continuous_duty
+                                };
+                                let adj_load = duty.max(0.0);
                                 let adj_cap = (q_capacity - q_fan + q_oa).max(1.0);
                                 (adj_load / adj_cap).clamp(plr_floor, 1.0)
                             } else {
@@ -7596,6 +7662,16 @@ mod tests {
     }
 
     #[test]
+    fn fan_only_air_cools_the_zone_in_winter() {
+        // 0.5 kg/s, 20% outdoor air at -10 C into a 21 C room, 1 K fan rise:
+        // the mix is 6.2 K under the room, the fan gives 1 K back.
+        let q = fan_only_heat_to_zone(0.5, 0.2, -10.0, 21.0, 1.0);
+        assert!((q - 0.5 * 1006.0 * (-6.2 + 1.0)).abs() < 1e-6);
+        // No outdoor air: only the fan heat reaches the zone.
+        assert!((fan_only_heat_to_zone(0.5, 0.0, -10.0, 21.0, 1.0) - 503.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn single_zone_coils_carry_outdoor_air_and_fan_heat() {
         // 0.1 kg/s of outdoor air on a 0.5 kg/s unit, 1 K fan rise,
         // -20 C heating and 34 C cooling design temperatures.
@@ -7603,7 +7679,10 @@ mod tests {
         assert!((heat - 0.1 * 1005.0 * 41.0).abs() < 1e-6);
         assert!((cool - (0.1 * 1005.0 * 10.0 + 0.5 * 1005.0)).abs() < 1e-6);
         // No outdoor air, no fan rise: nothing beyond the zone's own load.
-        assert_eq!(single_zone_coil_extra_design_load(0.0, 0.5, 0.0, -20.0, 34.0), (0.0, 0.0));
+        assert_eq!(
+            single_zone_coil_extra_design_load(0.0, 0.5, 0.0, -20.0, 34.0),
+            (0.0, 0.0)
+        );
         // Outdoor air is never more than the supply, and mild design
         // temperatures add no load of the wrong sign.
         let (heat, cool) = single_zone_coil_extra_design_load(2.0, 0.5, 0.0, 25.0, 20.0);
