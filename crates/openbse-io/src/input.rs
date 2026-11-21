@@ -1322,9 +1322,11 @@ pub struct HeatingCoilInput {
     /// Rated airflow [m³/s] for heat pump
     #[serde(default)]
     pub rated_airflow: f64,
-    /// Supplemental electric resistance capacity [W] (0 = none)
+    /// Supplemental electric resistance capacity [W] (0 = none). `autosize`
+    /// gives the backup the coil's heating capacity, so it carries the design
+    /// load alone when the compressor is locked out.
     #[serde(default)]
-    pub supplemental_capacity: f64,
+    pub supplemental_capacity: AutosizeValue,
     /// Compressor lockout temperature [°C] (default: -17.78 / 0°F)
     #[serde(default)]
     pub lockout_temp: Option<f64>,
@@ -3375,8 +3377,12 @@ fn build_graph_impl(
                                 rated_airflow,
                                 c.setpoint,
                             );
-                            if c.supplemental_capacity > 0.0 {
-                                coil = coil.with_supplemental(c.supplemental_capacity);
+                            // An autosized backup follows the coil: its
+                            // explicit capacity here, or what sizing gives it.
+                            if c.supplemental_capacity.is_autosize() {
+                                coil = coil.with_supplemental(cap);
+                            } else if c.supplemental_capacity.to_f64() > 0.0 {
+                                coil = coil.with_supplemental(c.supplemental_capacity.to_f64());
                             }
                             if let Some(lockout) = c.lockout_temp {
                                 coil = coil.with_lockout_temp(lockout);

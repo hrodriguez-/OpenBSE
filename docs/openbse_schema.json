@@ -715,7 +715,7 @@
         "parasitic_electric_load": { "type": "number", "default": 0.0, "minimum": 0, "description": "On-cycle parasitic electric load [W] for gas coils (draft / inducer fan). Runs with the burner; adds no heat to the supply air." },
         "cop": { "type": "number", "default": 3.0, "description": "Rated heating COP (heat_pump source only)." },
         "rated_airflow": { "type": "number", "default": 0.0, "description": "Rated airflow [m3/s] (heat_pump source only). 0 = derived from capacity (~500 CFM/ton)." },
-        "supplemental_capacity": { "type": "number", "default": 0.0, "minimum": 0, "description": "Supplemental electric resistance capacity [W] (heat_pump source only; 0 = none)." },
+        "supplemental_capacity": { "$ref": "#/$defs/AutosizeOrNumber", "default": 0.0, "description": "Supplemental electric resistance capacity [W] (heat_pump source only; 0 = none). autosize = the coil's heating capacity, so the backup carries the design load when the compressor is locked out." },
         "lockout_temp": { "type": "number", "description": "Compressor low-temperature lockout [C] (heat_pump source only). Default: -17.78 (0 F)." },
         "cap_ft_curve": { "type": "string", "description": "Name of a top-level performance curve for capacity f(T_outdoor) (heat_pump source only)." },
         "eir_ft_curve": { "type": "string", "description": "Name of a top-level performance curve for EIR f(T_outdoor) (heat_pump source only)." },

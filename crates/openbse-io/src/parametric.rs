@@ -425,7 +425,9 @@ fn set_heating_coil_field(c: &mut HeatingCoilInput, field: &str, value: f64) {
         "efficiency" => c.efficiency = value,
         "cop" => c.cop = value,
         "rated_airflow" => c.rated_airflow = value,
-        "supplemental_capacity" => c.supplemental_capacity = value,
+        "supplemental_capacity" => {
+            c.supplemental_capacity = openbse_core::types::AutosizeValue::Value(value)
+        }
         _ => log::warn!(
             "Unknown field '{}' on heating coil '{}' — skipping",
             field,

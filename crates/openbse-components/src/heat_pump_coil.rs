@@ -359,7 +359,7 @@ impl AirComponent for HeatPumpHeatingCoil {
 
         // ─── Supplemental electric resistance ────────────────────────────
         let q_shortfall = (q_required - q_hp).max(0.0);
-        let q_supplemental = q_shortfall.min(self.supplemental_capacity);
+        let q_supplemental = q_shortfall.min(self.supplemental_capacity.max(0.0));
         let p_supplemental = q_supplemental; // electric resistance: COP = 1.0
 
         // ─── Total heating and outlet temperature ────────────────────────
@@ -410,11 +410,18 @@ impl AirComponent for HeatPumpHeatingCoil {
     }
 
     fn set_nominal_capacity(&mut self, cap: f64) {
+        // A backup marked autosize is sized with the coil.
+        if openbse_core::types::is_autosize(self.supplemental_capacity) {
+            self.supplemental_capacity = cap;
+        }
         self.rated_capacity = cap;
     }
 
     fn unsized_fields(&self) -> Vec<&'static str> {
-        openbse_core::types::autosize_fields([("capacity", self.rated_capacity)])
+        openbse_core::types::autosize_fields([
+            ("capacity", self.rated_capacity),
+            ("supplemental_capacity", self.supplemental_capacity),
+        ])
     }
 
     fn power_consumption(&self) -> f64 {
