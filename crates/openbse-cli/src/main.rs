@@ -6581,14 +6581,14 @@ fn simulate_all_loops(
             // compressor, so the min-OA fraction doubles as the minimum runtime
             // needed to deliver ventilation air, and the floor stays.
             // A fan coil draws no outdoor air at all, so it has no floor.
-            let plr_floor =
-                if li.fan_operating_mode == openbse_io::input::FanOperatingMode::Continuous
-                    || li.system_type == AirLoopSystemType::Fcu
-                {
-                    0.0
-                } else {
-                    effective_min_oa
-                };
+            let plr_floor = if li.fan_operating_mode
+                == openbse_io::input::FanOperatingMode::Continuous
+                || li.system_type == AirLoopSystemType::Fcu
+            {
+                0.0
+            } else {
+                effective_min_oa
+            };
 
             if let Some(ref supply) = supply_air {
                 let supply_temp = supply.state.t_db;
