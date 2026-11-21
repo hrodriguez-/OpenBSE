@@ -7737,11 +7737,20 @@ mod tests {
         // 600 W of slack before the 21 C heating setpoint, 500 W/K line:
         // holding 24 C takes 1500 W more heat than holding 21 C, so the zone
         // floats 900 W short of needing cooling.
-        assert_eq!(load_to_cooling_setpoint(-600.0, 500.0, 21.0, 24.0), Some(-900.0));
+        assert_eq!(
+            load_to_cooling_setpoint(-600.0, 500.0, 21.0, 24.0),
+            Some(-900.0)
+        );
         // 2400 W of slack: it needs 900 W of cooling to stay at 24 C.
-        assert_eq!(load_to_cooling_setpoint(-2400.0, 500.0, 21.0, 24.0), Some(900.0));
+        assert_eq!(
+            load_to_cooling_setpoint(-2400.0, 500.0, 21.0, 24.0),
+            Some(900.0)
+        );
         // No heating setpoint, or no line yet: unknown.
-        assert_eq!(load_to_cooling_setpoint(f64::NEG_INFINITY, 500.0, 21.0, 24.0), None);
+        assert_eq!(
+            load_to_cooling_setpoint(f64::NEG_INFINITY, 500.0, 21.0, 24.0),
+            None
+        );
         assert_eq!(load_to_cooling_setpoint(-600.0, 0.0, 21.0, 24.0), None);
     }
 
