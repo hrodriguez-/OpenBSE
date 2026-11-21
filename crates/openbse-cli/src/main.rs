@@ -321,6 +321,20 @@ fn single_zone_coil_extra_design_load(
     (heat, cool)
 }
 
+/// Signed load to the cooling setpoint [W], positive when the zone needs
+/// cooling to stay at it, from the signed load to the heating setpoint and
+/// the load line's slope [W/K] (the load is linear in the target
+/// temperature). None without a heating setpoint or a load line.
+fn load_to_cooling_setpoint(
+    to_heating_sp: f64,
+    slope: f64,
+    heat_sp: f64,
+    cool_sp: f64,
+) -> Option<f64> {
+    (to_heating_sp.is_finite() && slope > 0.0)
+        .then(|| -(to_heating_sp + slope * (cool_sp - heat_sp)))
+}
+
 /// Heat [W] a unit's fan-only air delivers to a zone held at `t_zone`: the
 /// supply flow, mixed with its outdoor-air fraction and warmed by the fan,
 /// against the room. Negative when cold outdoor air outweighs the fan heat.
@@ -2846,6 +2860,11 @@ fn main() -> Result<()> {
                             .iter()
                             .map(|z| (z.input.name.clone(), z.load_to_heating_setpoint))
                             .collect();
+                        let load_line_slopes: HashMap<String, f64> = env
+                            .zones
+                            .iter()
+                            .map(|z| (z.input.name.clone(), z.ideal_load_line.slope))
+                            .collect();
 
                         // Single HVAC pass (no iterating during warmup — faster)
                         let empty_predictor: HashMap<String, f64> = HashMap::new();
@@ -2904,6 +2923,7 @@ fn main() -> Result<()> {
                             &current_cooling_loads,
                             &current_heating_loads,
                             &loads_to_heating_sp,
+                            &load_line_slopes,
                             &initial_zone_temps,
                             &zone_thermal_caps,
                             &empty_predictor,
@@ -3310,6 +3330,11 @@ fn main() -> Result<()> {
                             .iter()
                             .map(|z| (z.input.name.clone(), z.load_to_heating_setpoint))
                             .collect();
+                        let mut load_line_slopes: HashMap<String, f64> = env
+                            .zones
+                            .iter()
+                            .map(|z| (z.input.name.clone(), z.ideal_load_line.slope))
+                            .collect();
 
                         let mut final_hvac_result = None;
                         let mut final_env_result = None;
@@ -3532,6 +3557,7 @@ fn main() -> Result<()> {
                                     &current_cooling_loads,
                                     &current_heating_loads,
                                     &loads_to_heating_sp,
+                                    &load_line_slopes,
                                     &initial_zone_temps,
                                     &zone_thermal_caps,
                                     &predictor_no_hvac_temps,
@@ -4302,6 +4328,7 @@ fn main() -> Result<()> {
                                         });
                                     current_heating_loads.insert(name.clone(), to_heat.max(0.0));
                                     loads_to_heating_sp.insert(name.clone(), to_heat);
+                                    load_line_slopes.insert(name.clone(), z.ideal_load_line.slope);
                                     current_cooling_loads.insert(name.clone(), cooling);
                                 }
                             }
@@ -5874,6 +5901,7 @@ fn simulate_all_loops(
     zone_cooling_loads: &HashMap<String, f64>,
     zone_heating_loads: &HashMap<String, f64>,
     zone_loads_to_heating_sp: &HashMap<String, f64>,
+    zone_load_slopes: &HashMap<String, f64>,
     initial_zone_temps: &HashMap<String, f64>,
     zone_thermal_caps: &HashMap<String, f64>,
     predictor_no_hvac_temps: &HashMap<String, f64>,
@@ -6142,8 +6170,26 @@ fn simulate_all_loops(
                     heat_sp,
                     li.supply_fan_dt,
                 );
+                // The mirror in cooling: fan heat and warm outdoor air tip a
+                // zone that needs nothing on its own over the cooling setpoint.
+                let cool_sp = active_cool_sp.get(zname).copied().unwrap_or(23.9);
+                let to_cool = load_to_cooling_setpoint(
+                    to_heat,
+                    zone_load_slopes.get(zname).copied().unwrap_or(0.0),
+                    heat_sp,
+                    cool_sp,
+                );
+                let fan_only_cooling_sp = fan_only_heat_to_zone(
+                    flow,
+                    effective_min_oa,
+                    t_outdoor,
+                    cool_sp,
+                    li.supply_fan_dt,
+                );
                 if to_heat - fan_only > 10.0 {
                     predictor_modes.insert(zname.clone(), HvacMode::Heating);
+                } else if to_cool.is_some_and(|q| q + fan_only_cooling_sp > 10.0) {
+                    predictor_modes.insert(zname.clone(), HvacMode::Cooling);
                 }
             }
         }
@@ -6643,8 +6689,33 @@ fn simulate_all_loops(
                                 control_temp,
                             );
 
-                            if corrected_load > 10.0 {
-                                let adj_load = corrected_load + q_fan + q_oa;
+                            // Continuous fan: the coil's duty is the SIGNED
+                            // load to setpoint plus what the fan-only air
+                            // adds, a cooling duty even when the zone's own
+                            // load is nil (see the heating case above).
+                            let continuous_duty = if li.fan_operating_mode
+                                == openbse_io::input::FanOperatingMode::Continuous
+                            {
+                                load_to_cooling_setpoint(
+                                    zone_loads_to_heating_sp
+                                        .get(control_zone)
+                                        .copied()
+                                        .unwrap_or(f64::NEG_INFINITY),
+                                    zone_load_slopes.get(control_zone).copied().unwrap_or(0.0),
+                                    heat_sp,
+                                    cool_sp,
+                                )
+                                .map_or(0.0, |q| q * zmult_plr + q_fan + q_oa)
+                            } else {
+                                0.0
+                            };
+
+                            if corrected_load > 10.0 || continuous_duty > 10.0 {
+                                let adj_load = if corrected_load > 10.0 {
+                                    corrected_load + q_fan + q_oa
+                                } else {
+                                    continuous_duty
+                                };
                                 let adj_cap = (q_capacity + q_fan + q_oa).max(1.0);
                                 (adj_load / adj_cap).clamp(plr_floor, 1.0)
                             } else {
@@ -7659,6 +7730,19 @@ mod tests {
             1.25,
         );
         assert!((coincident - 12.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cooling_load_follows_the_load_line_from_the_heating_one() {
+        // 600 W of slack before the 21 C heating setpoint, 500 W/K line:
+        // holding 24 C takes 1500 W more heat than holding 21 C, so the zone
+        // floats 900 W short of needing cooling.
+        assert_eq!(load_to_cooling_setpoint(-600.0, 500.0, 21.0, 24.0), Some(-900.0));
+        // 2400 W of slack: it needs 900 W of cooling to stay at 24 C.
+        assert_eq!(load_to_cooling_setpoint(-2400.0, 500.0, 21.0, 24.0), Some(900.0));
+        // No heating setpoint, or no line yet: unknown.
+        assert_eq!(load_to_cooling_setpoint(f64::NEG_INFINITY, 500.0, 21.0, 24.0), None);
+        assert_eq!(load_to_cooling_setpoint(-600.0, 0.0, 21.0, 24.0), None);
     }
 
     #[test]
