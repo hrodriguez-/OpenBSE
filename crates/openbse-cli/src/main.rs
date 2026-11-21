@@ -1780,8 +1780,9 @@ fn main() -> Result<()> {
                                     _ => None,
                                 })
                                 .sum();
-                            let oa_mass =
-                                (oa.per_person * people + oa.per_area * zone.input.floor_area) * 1.2;
+                            let oa_mass = (oa.per_person * people
+                                + oa.per_area * zone.input.floor_area)
+                                * 1.2;
                             vrf_zone_oa_load.insert(
                                 zone.input.name.clone(),
                                 single_zone_coil_extra_design_load(
