@@ -1038,14 +1038,20 @@ pub fn build_doas_signals(li: &LoopInfo, ctx: &SignalCtx) -> ControlSignals {
 
     let mut signals = ControlSignals::default();
 
-    // Total ventilation airflow = 30% of zone design flows
-    let vent_flow_total: f64 = li
-        .served_zones
-        .iter()
-        .map(|z| zone_design_flows.get(z).copied().unwrap_or(0.1))
-        .sum::<f64>()
-        * 0.30;
-    let vent_flow = vent_flow_total.max(0.05);
+    // Ventilation airflow: the served zones' outdoor-air requirement (set
+    // after sizing from their `outdoor_air` specs, or `minimum_oa_flow`).
+    // Without one, 30% of the zone design flows. That fallback moved about
+    // eight times an office's requirement, and its preheat alone tripled the
+    // building's energy.
+    let vent_flow = li.min_oa_flow_mass.filter(|m| *m > 0.0).unwrap_or_else(|| {
+        let total: f64 = li
+            .served_zones
+            .iter()
+            .map(|z| zone_design_flows.get(z).copied().unwrap_or(0.1))
+            .sum::<f64>()
+            * 0.30;
+        total.max(0.05)
+    });
 
     // Supply setpoints: heat to 2°C above zone heating setpoint,
     // cool to 2°C below zone cooling setpoint.
@@ -1158,7 +1164,12 @@ pub fn build_fcu_signals(li: &LoopInfo, ctx: &SignalCtx) -> ControlSignals {
         || li.fan_operating_mode == openbse_io::input::FanOperatingMode::ContinuousNoLoadOff;
     let is_no_load_off_mode =
         li.fan_operating_mode == openbse_io::input::FanOperatingMode::ContinuousNoLoadOff;
-    let flow = if is_ptac {
+    // A fan coil follows the load the same way: coil at its design supply
+    // temperature, runtime from the zone load. Its old proportional ramp
+    // (fan and coil over a 5 K error) held zones 1-3 K off setpoint whenever
+    // there was load. It recirculates only; its outdoor air stays zero.
+    let load_cycled = is_ptac || li.system_type == AirLoopSystemType::Fcu;
+    let flow = if load_cycled {
         match mode {
             HvacMode::Deadband => {
                 if is_continuous_fan_mode && !is_no_load_off_mode {
@@ -1200,7 +1211,7 @@ pub fn build_fcu_signals(li: &LoopInfo, ctx: &SignalCtx) -> ControlSignals {
     // FCU uses proportional modulation: coil setpoint varies with zone error.
     for name in &li.component_names {
         let role = li.coil_role(name);
-        if is_ptac {
+        if load_cycled {
             // PTAC / PTHP control matching EnergyPlus:
             //
             // Heating: coil targets the design supply temp at full capacity.

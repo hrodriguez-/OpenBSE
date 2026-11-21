@@ -1980,7 +1980,38 @@ fn main() -> Result<()> {
                                         * zone_multipliers.get(z).copied().unwrap_or(1) as f64
                                 })
                                 .sum();
-                            let oa_flow_kg = zone_airflow * 0.30;
+                            // The airflow the unit will move: `minimum_oa_flow`,
+                            // else the served zones' outdoor-air requirement,
+                            // else 30% of the zone design flows.
+                            let required_oa_m3: f64 = li
+                                .served_zones
+                                .iter()
+                                .filter_map(|zn| env.zones.iter().find(|z| z.input.name == *zn))
+                                .filter_map(|zone| {
+                                    zone.input.outdoor_air.as_ref().map(|oa| {
+                                        let people: f64 = zone
+                                            .input
+                                            .internal_gains
+                                            .iter()
+                                            .filter_map(|g| match g {
+                                                openbse_envelope::InternalGainInput::People {
+                                                    count,
+                                                    ..
+                                                } => Some(*count),
+                                                _ => None,
+                                            })
+                                            .sum();
+                                        (oa.per_person * people
+                                            + oa.per_area * zone.input.floor_area)
+                                            * zone.input.zone_multiplier as f64
+                                    })
+                                })
+                                .sum();
+                            let oa_flow_kg = match li.min_oa_flow_mass {
+                                Some(m) if m > 0.0 => m,
+                                _ if required_oa_m3 > 0.0 => required_oa_m3 * air_density,
+                                _ => zone_airflow * 0.30,
+                            };
                             let oa_flow_m3 = oa_flow_kg / air_density;
 
                             // Find design outdoor temps from design days
@@ -2414,6 +2445,17 @@ fn main() -> Result<()> {
                                         * zone.input.zone_multiplier as f64;
                                 }
                             }
+                        }
+                        if has_oa
+                            && li.system_type == AirLoopSystemType::Doas
+                            && li.min_oa_flow_mass.is_none()
+                            && total_oa_flow > 0.0
+                        {
+                            li.min_oa_flow_mass = Some(total_oa_flow * li.std_air_density);
+                            info!(
+                                "Air loop '{}': DOAS airflow {:.3} m³/s from the zones' outdoor-air requirement",
+                                li.name, total_oa_flow
+                            );
                         }
                         if has_oa && !li.explicit_min_oa {
                             let new_frac = (total_oa_flow / flow_m3s).clamp(0.0, 1.0);
@@ -5977,6 +6019,11 @@ fn simulate_all_loops(
                 heat_sp.is_some_and(|sp| t < sp - nightcycle_tolerance)
                     || cool_sp.is_some_and(|sp| t > sp + nightcycle_tolerance)
             });
+            // A dedicated outdoor-air unit stays off: the night cycle holds
+            // the setback with the damper closed, and a unit that is all
+            // outdoor air has nothing to recirculate. Cycled on, it heated its
+            // full airflow from outdoors through winter nights for nobody.
+            let triggered = triggered && li.system_type != AirLoopSystemType::Doas;
             let timer = nightcycle_timers.get(&li.name).copied().unwrap_or(0.0);
             if triggered || timer > 0.0 {
                 is_unoccupied = true;
@@ -6490,6 +6537,7 @@ fn simulate_all_loops(
         } else if li.system_type == AirLoopSystemType::PszAc
             || li.system_type == AirLoopSystemType::Ptac
             || li.system_type == AirLoopSystemType::Pthp
+            || li.system_type == AirLoopSystemType::Fcu
         {
             let control_zone = li.served_zones.first().map(|s| s.as_str()).unwrap_or("");
             // Zone multiplier: equipment is sized for multiplied load, so the
@@ -6532,8 +6580,11 @@ fn simulate_all_loops(
             // zone in mild hours. In cycling-fan mode the fan cycles WITH the
             // compressor, so the min-OA fraction doubles as the minimum runtime
             // needed to deliver ventilation air, and the floor stays.
+            // A fan coil draws no outdoor air at all, so it has no floor.
             let plr_floor =
-                if li.fan_operating_mode == openbse_io::input::FanOperatingMode::Continuous {
+                if li.fan_operating_mode == openbse_io::input::FanOperatingMode::Continuous
+                    || li.system_type == AirLoopSystemType::Fcu
+                {
                     0.0
                 } else {
                     effective_min_oa
