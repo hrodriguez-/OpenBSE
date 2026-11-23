@@ -2923,9 +2923,10 @@ fn main() -> Result<()> {
         let mut timesteps_run: usize = 0;
         let mut sim_time = start_hour as f64 * 3600.0;
 
-        // Night-cycle timers: per-loop remaining ON time [seconds].
+        // Night-cycle timers: per-loop stop time of the running cycle
+        // [simulation seconds]; 0 = no cycle running.
         //
-        // E+ AvailabilityManager:NightCycle uses cycling_run_time = 1800 s (30 min).
+        // E+ AvailabilityManager:NightCycle (HVACTemplate: FixedRunTime, 3600 s).
         // Once night-cycle triggers, the system stays ON for this duration before
         // rechecking. This prevents destructive ON/OFF oscillation at sub-hourly
         // timesteps where the system would heat the zone above the trigger point,
@@ -6134,13 +6135,13 @@ fn simulate_all_loops(
         // unoccupied periods while saving significant energy vs. maintaining
         // occupied setpoints 24/7.
         //
-        // E+ AvailabilityManager:NightCycle behavior:
+        // E+ AvailabilityManager:NightCycle behavior (as HVACTemplate writes it):
         //   - Control type: CycleOnAny (any zone triggers night-cycle)
-        //   - Thermostat tolerance: 1.0°C (zone must be 1°C beyond setpoint)
-        //   - Cycling run time: 1800s (30 min ON, then recheck)
+        //   - Thermostat tolerance: 0.2°C beyond the unoccupied setpoint
+        //   - FixedRunTime, 3600 s: ON for the full run time, then recheck
         //
         // The cycling_run_time is critical: once night-cycle triggers ON, the
-        // system stays ON for the full 1800s before rechecking conditions.
+        // system stays ON for the full run time before rechecking conditions.
         // Without this, sub-hourly timesteps cause destructive ON/OFF
         // oscillation where the system repeatedly heats thermal mass then
         // lets it drain, wasting enormous energy.
@@ -6164,8 +6165,14 @@ fn simulate_all_loops(
             // stays ON for the cycling run time. While cycled on it pursues
             // the unoccupied setpoints with the outdoor-air damper closed
             // (is_unoccupied below).
+            // Decided once per timestep, on the start-of-step zone temperatures
+            // (E+ evaluates availability before the HVAC iterations, on the
+            // previous step's MAT). This function runs once per HVAC
+            // iteration: checked on the iterate's temperatures, the first
+            // iteration left the loop off, the zones free-fell, and the next
+            // iteration saw that drop and cycled the loop on, every step.
             let triggered = li.served_zones.iter().any(|z| {
-                let t = match zone_temps.get(z) {
+                let t = match initial_zone_temps.get(z).or_else(|| zone_temps.get(z)) {
                     Some(t) => *t,
                     None => return false,
                 };
@@ -6185,11 +6192,28 @@ fn simulate_all_loops(
             // outdoor air has nothing to recirculate. Cycled on, it heated its
             // full airflow from outdoors through winter nights for nobody.
             let triggered = triggered && li.system_type != AirLoopSystemType::Doas;
-            let timer = nightcycle_timers.get(&li.name).copied().unwrap_or(0.0);
-            if triggered || timer > 0.0 {
+            // FixedRunTime (E+ CalcNightCycleSysAvailMgr): a started cycle
+            // runs the full run time whatever the zones do, and the zones are
+            // checked again only once it has expired. The timer holds the
+            // cycle's stop time, not a remaining time: counted down per call
+            // it lost one timestep per HVAC iteration, so a 3600 s run ended
+            // within the step that started it. At expiry the zone the system
+            // has just pulled up to the setback reads in tolerance, so the
+            // loop rests a step before the next cycle (4 on, 1 off at
+            // 15-minute steps, as E+); before, it ran all night (B094: night
+            // fan airflow 44 % above the E+ twin).
+            let now = ctx.timestep.sim_time_s;
+            let stop_time = nightcycle_timers.get(&li.name).copied().unwrap_or(0.0);
+            let cycling = if now < stop_time {
+                true
+            } else if triggered {
+                nightcycle_timers.insert(li.name.clone(), now + cycling_run_time);
+                true
+            } else {
+                false
+            };
+            if cycling {
                 is_unoccupied = true;
-                let run_time = if triggered { cycling_run_time } else { timer };
-                nightcycle_timers.insert(li.name.clone(), (run_time - _dt).max(0.0));
             } else {
                 nightcycle_timers.insert(li.name.clone(), 0.0);
                 for comp_name in &li.component_names {

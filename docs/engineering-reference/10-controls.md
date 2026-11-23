@@ -193,6 +193,43 @@ if T_zone > T_cooling_setpoint:  mode = Cooling
 otherwise:                       mode = Deadband
 ```
 
+### Night-Cycle Availability
+
+**Source:** `openbse-cli/src/main.rs` (`simulate_all_loops`, availability check).
+
+While an air loop's `availability_schedule` is below 0.5 the loop is off
+unless the night cycle starts it. The night cycle follows the
+`AvailabilityManager:NightCycle` that EnergyPlus HVACTemplate generates:
+CycleOnAny, a 0.2 K thermostat tolerance and FixedRunTime of 3600 s.
+
+1. The decision is made once per timestep, on the zone temperatures at the
+   start of the step. The HVAC iterations within the step do not re-check it.
+2. If no cycle is running, the loop starts one when any served zone is more
+   than 0.2 K below its unoccupied heating setpoint or above its unoccupied
+   cooling setpoint. A dedicated outdoor-air loop never starts.
+3. A started cycle stores its stop time (start + 3600 s) and runs until the
+   simulation clock reaches it, whatever the zones do meanwhile.
+4. At the stop time the zones are checked again. A zone the cycle has just
+   brought to its setback reads in tolerance, so the loop rests for at least
+   one timestep before the next cycle.
+
+While cycled on, the loop pursues the unoccupied setpoints with the minimum
+outdoor air set to zero.
+
+**Comparison with EnergyPlus.** This matches
+`SystemAvailabilityManager::CalcNightCycleSysAvailMgr` with FixedRunTime. At
+15-minute steps on a cold night both engines run 4 steps on, 1 off (B094 in
+the GRACIE 100-building benchmark, 2026-11-23). Before this, the check ran on
+every HVAC iteration, on that iteration's temperatures, and counted the run
+time down once per iteration. The first iteration left the loop off, the next
+saw the resulting free-fall and started it, and the 3600 s run lasted a single
+step. The loop therefore ran every unoccupied step that needed any heat or
+cooling, with about 25 % more night airflow than EnergyPlus.
+
+**Limitations.** The tolerance, run time and control type are fixed. The
+input has no fields for ThermostatWithMinimumRunTime, CycleOnControlZone or
+the cooling-only and heating-only variants.
+
 ---
 
 ### PSZ-AC (Packaged Single-Zone AC)
